@@ -24,27 +24,6 @@ Userscript hỗ trợ quản lý truyện và chương trên TYT Novel.
 4. Đăng nhập TYT Novel.
 5. Mở trang `https://tytnovel.info/`.
 
-## Cập nhật
-
-Tampermonkey sẽ kiểm tra phiên bản mới thông qua metadata `@updateURL`.
-
-Khi phát hành bản mới:
-
-1. Tăng số tại `@version`.
-2. Đồng thời sửa hằng số `VERSION` trong mã nguồn.
-3. Ghi đè file `tyt-bulk-manager.user.js` trên nhánh `main`.
-4. Người dùng có thể kiểm tra cập nhật trong Tampermonkey.
-
-Ví dụ:
-
-```javascript
-// @version      1.5.2
-```
-
-```javascript
-const VERSION = '1.5.2';
-```
-
 ## Cảnh báo
 
 Script thao tác trực tiếp trên dữ liệu của tài khoản TYT đang đăng nhập.
