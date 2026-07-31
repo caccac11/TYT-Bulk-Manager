@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.5.1
+// @version      1.6.0
 // @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, đổi tên, đánh số và thống kê doanh thu.
 // @author       GinKai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
@@ -18,16 +18,22 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.5.1';
+  const VERSION = '1.6.0';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
-  const CACHE_TTL = 60 * 60 * 1000;
+  const CACHE_TTL = 60 * 1000;
+  const CACHE_MAX_ENTRIES = 100;
   const ID_RE = /^[0-9a-f]{24}$/i;
   const STORY_RE = /\/mystory\/([0-9a-f]{24})(?:\/|$)/i;
   const EDIT_RE = /\/mystory\/([0-9a-f]{24})\/chapters\/([0-9a-f]{24})\/edit\/?(?:[?#].*)?$/i;
   const CHAPTER_HEADING_RE = /^\s*(?:chương|chapter|chap)\s*([0-9]{1,6})\s*(?:[:：.\-–—)]\s*(.*?))?\s*$/i;
   const CN_HEADING_RE = /^\s*第\s*([0-9]{1,6})\s*章\s*(.*?)\s*$/i;
   const BLANK_P = '<p>&nbsp;</p>';
+  const SCRIPT_INFO = Object.freeze({
+    authorName: 'GinKai',
+    authorProfileUrl: 'https://tytnovel.info/profile/68d1850877d97e06be011ae8',
+    authorMessage: '1 Editor siêu flop trên TYT, nếu có thể thì hãy ghé qua đọc thử truyện của mình làm nhé~',
+  });
 
   const defaults = {
     maxPages: 200,
@@ -491,6 +497,7 @@
         alert(`${name} không thể hoàn tất.\n\n${message}`);
       }
     } finally {
+      state.editCache.clear();
       state.busy = false;
       updateBusyUI(false);
     }
@@ -829,6 +836,28 @@
     return `${ref.storyId || state.storyId}:${ref.chapterId}`;
   }
 
+
+  function cacheEditState(key, value) {
+    state.editCache.delete(key);
+    state.editCache.set(key, value);
+    while (state.editCache.size > CACHE_MAX_ENTRIES) {
+      const oldestKey = state.editCache.keys().next().value;
+      state.editCache.delete(oldestKey);
+    }
+  }
+
+  function readCachedEditState(key) {
+    const cached = state.editCache.get(key);
+    if (!cached) return null;
+    if (Date.now() - cached.fetchedAt >= CACHE_TTL) {
+      state.editCache.delete(key);
+      return null;
+    }
+    state.editCache.delete(key);
+    state.editCache.set(key, cached);
+    return structuredClone(cached);
+  }
+
   function extractEditState(html, ref, sourceUrl) {
     const doc = parseHtml(html);
     const fields = parseFormFields(doc);
@@ -879,8 +908,8 @@
     if (!ID_RE.test(ref.storyId || state.storyId)) throw new Error(`Story ID không hợp lệ: ${ref.storyId || state.storyId}`);
     ref.storyId = ref.storyId || state.storyId;
     const key = editCacheKey(ref);
-    const cached = state.editCache.get(key);
-    if (!force && cached && Date.now() - cached.fetchedAt < CACHE_TTL) return structuredClone(cached);
+    const cached = force ? null : readCachedEditState(key);
+    if (cached) return cached;
 
     const makeCandidates = currentRef => {
       const canonical = `/mystory/${currentRef.storyId}/chapters/${currentRef.chapterId}/edit`;
@@ -905,7 +934,7 @@
           const sourceUrl = `${finalPath.pathname}${finalPath.search}`;
           ref.editUrl = sourceUrl;
           const parsed = extractEditState(text, ref, sourceUrl);
-          state.editCache.set(key, parsed);
+          cacheEditState(key, parsed);
           return structuredClone(parsed);
         } catch (err) {
           if (err?.status === 404) { last404 = err; continue; }
@@ -941,9 +970,29 @@
     return results.map(x => x.edit);
   }
 
+  function comparableChapterText(html) {
+    return htmlToPlainText(html).replace(/\s+/g, ' ').trim();
+  }
+
+  async function verifyChapterUpdate(ref, expected, changedKeys) {
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) await sleep(500 * attempt);
+      state.editCache.delete(editCacheKey(ref));
+      const fresh = await getEditState(ref, true);
+      last = fresh;
+      const titleOk = !changedKeys.has('title') || fresh.title === expected.title;
+      const numberOk = !changedKeys.has('number') || fresh.number === expected.number;
+      const contentOk = !changedKeys.has('content') || comparableChapterText(fresh.content) === comparableChapterText(expected.content);
+      const publishedOk = !changedKeys.has('published') || String(fresh.published) === String(expected.published);
+      if (titleOk && numberOk && contentOk && publishedOk) return fresh;
+    }
+    throw new Error(`Máy chủ báo thành công nhưng xác minh lại chương ${ref.number ?? '?'} không khớp dữ liệu đã gửi.`);
+  }
+
   async function updateChapter(chapterOrId, changes) {
     const ref = chapterRef(chapterOrId);
-    const edit = await getEditState(ref);
+    const edit = await getEditState(ref, true);
     const next = { ...edit, ...changes };
     next.title = normSpace(next.title);
     next.number = Number(next.number);
@@ -954,8 +1003,9 @@
     if (next.published !== '') payload.published = String(next.published);
     const updateUrl = edit.updateUrl || ref.updateUrl || `/mystory/${edit.storyId}/chapters/${ref.chapterId}/update`;
     const res = await postForm(updateUrl, payload, edit.editUrl);
-    const saved = { ...edit, ...next, fields: payload, updateUrl, fetchedAt: Date.now() };
-    state.editCache.set(editCacheKey(ref), saved);
+    const fresh = await verifyChapterUpdate(ref, next, new Set(Object.keys(changes || {})));
+    Object.assign(ref, { title: fresh.title, number: fresh.number });
+    cacheEditState(editCacheKey(ref), fresh);
     return res;
   }
 
@@ -969,6 +1019,63 @@
     return String(template || '').replaceAll('{num}', String(num)).replaceAll('{old}', old).replaceAll('{tail}', titleTail(old)).replace(/:\s*$/,'').trim();
   }
 
+
+  async function backupChoiceModal(actionName, count) {
+    return choiceModal(
+      'Sao lưu trước khi thao tác',
+      `Bạn có muốn sao lưu ${count} chương trước khi ${actionName} không?\n\nSao lưu giúp khôi phục nội dung nếu thao tác nhầm. Bỏ qua sao lưu nghĩa là script sẽ không tạo file dự phòng.`,
+      [
+        { value: 'cancel', text: 'Hủy', className: '' },
+        { value: 'skip', text: 'Bỏ qua sao lưu', className: 'warn' },
+        { value: 'backup', text: 'Sao lưu rồi tiếp tục', className: 'primary' },
+      ],
+    );
+  }
+
+  async function createChapterBackup(rows, actionName) {
+    const sorted = rows.slice().sort(chapterCompare);
+    const results = await mapLimit(sorted, Math.min(2, state.cfg.readWorkers), async ch => {
+      const edit = await getEditState(ch, true);
+      return {
+        ok: true,
+        storyId: edit.storyId,
+        chapterId: edit.chapterId,
+        number: edit.number,
+        title: edit.title,
+        published: edit.published,
+        contentHtml: edit.content,
+        contentText: htmlToPlainText(edit.content),
+      };
+    }, (done, total, result) => {
+      setProgress(done, total);
+      setStatus(`Sao lưu: ${done}/${total}`);
+      if (result?.error) debugLog('Sao lưu chương không thành công', result.error, 'error');
+    });
+    const failed = results.filter(item => item?.error || !item?.ok);
+    if (failed.length) throw new Error(`Sao lưu thất bại ${failed.length}/${rows.length} chương. Tác vụ đã dừng.`);
+    const payload = {
+      format: 'TYT Bulk Manager Backup',
+      version: VERSION,
+      action: actionName,
+      createdAt: new Date().toISOString(),
+      storyId: state.storyId,
+      storyTitle: state.storyTitle,
+      chapters: results,
+    };
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `${safeName(state.storyTitle)}_${safeName(actionName)}_${stamp}.json`;
+    saveBlob(new Blob(['\uFEFF', JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }), filename);
+    log(`Đã tạo bản sao lưu ${results.length} chương.`, 'success');
+  }
+
+  async function prepareBackup(rows, actionName) {
+    const choice = await backupChoiceModal(actionName, rows.length);
+    if (choice === 'cancel') return false;
+    if (choice === 'backup') await createChapterBackup(rows, actionName);
+    else log(`Đã bỏ qua sao lưu trước khi ${actionName}.`, 'warn');
+    return true;
+  }
+
   async function deleteChapters() {
     requireStory();
     const rows = selectedChapters();
@@ -976,6 +1083,7 @@
     const preview = rows.slice(0, 50).map(ch => `${ch.number ?? '?'} — ${ch.title}`).join('\n');
     const ok = await confirmModal('Xóa chương', `Sẽ XÓA VĨNH VIỄN ${rows.length} chương:\n\n${preview}${rows.length > 50 ? '\n...' : ''}\n\nKhông thể hoàn tác.`, 'XÓA VĨNH VIỄN');
     if (!ok) return;
+    if (!await prepareBackup(rows, 'xóa chương')) return;
     const successes = new Set();
     const results = await mapLimit(rows, state.cfg.deleteWorkers, async ch => {
       await postForm(ch.deleteUrl || `/mystory/${ch.storyId || state.storyId}/chapters/${ch.chapterId}/delete`, { captcha: 'delete' }, ch.editUrl || `/mystory/${ch.storyId || state.storyId}/chapters/${ch.chapterId}/edit`);
@@ -1003,6 +1111,7 @@
     if (!plans.length) { log('Tất cả chương đã đúng mẫu, không cần cập nhật.'); return; }
     const preview = plans.slice(0, 80).map(x => `${x.ch.number}: ${x.ch.title}\n   → ${x.title}`).join('\n');
     if (!await confirmModal('Đổi tên chương', `${plans.length} chương sẽ đổi tên:\n\n${preview}${plans.length > 80 ? '\n...' : ''}`, 'ĐỔI TÊN')) return;
+    if (!await prepareBackup(plans.map(x => x.ch), 'đổi tên chương')) return;
     await preloadEditStates(plans.map(x => x.ch), 'Chuẩn bị đổi tên');
     let okCount = 0;
     const results = await mapLimit(plans, state.cfg.writeWorkers, async p => {
@@ -1045,6 +1154,7 @@
     if (!plans.length) { log('Tất cả chương đã đúng số, không cần cập nhật.'); return; }
     const preview = plans.slice(0, 100).map(p => `${p.old} → ${p.target} | ${p.ch.title}`).join('\n');
     if (!await confirmModal('Đánh số lại', `${plans.length} chương sẽ đổi số. Script dùng thuật toán phụ thuộc an toàn, không tạo số trùng tạm thời.\n\n${preview}${plans.length > 100 ? '\n...' : ''}`, 'ĐÁNH SỐ LẠI')) return;
+    if (!await prepareBackup(plans.map(p => p.ch), 'đánh số lại')) return;
     await preloadEditStates(plans.map(p => p.ch), 'Chuẩn bị đánh số');
 
     const occupied = new Set(state.chapters.filter(ch => Number.isInteger(ch.number)).map(ch => ch.number));
@@ -1305,7 +1415,7 @@
     const lines = text.split('\n');
     const chapters = [];
     let current = null;
-    let ignored = 0;
+    const ignoredLines = [];
     let headingCount = 0;
     const flush = () => {
       if (!current) return;
@@ -1329,7 +1439,7 @@
       } else if (current) {
         current.lines.push(line);
       } else if (line.trim()) {
-        ignored++;
+        ignoredLines.push(line);
       }
     }
     flush();
@@ -1344,7 +1454,7 @@
         visibleChars: normSpace(text).length,
       });
     }
-    return { chapters, ignored, headingCount };
+    return { chapters, ignored: ignoredLines.length, ignoredLines, headingCount };
   }
 
   async function applyParsedChapterUpdates(parsed, sourceLabel) {
@@ -1383,6 +1493,7 @@
       ? `\n\nKhông tìm thấy trên web: ${missing.slice(0, 50).join(', ')}${missing.length > 50 ? '...' : ''}`
       : '';
     if (!await confirmModal(`Cập nhật nội dung từ ${sourceLabel}`, `${plans.length} chương sẽ cập nhật theo SỐ CHƯƠNG, không theo vị trí.\n\n${preview}${missText}`, 'CẬP NHẬT')) return;
+    if (!await prepareBackup(plans.map(p => p.ch), `cập nhật nội dung từ ${sourceLabel}`)) return;
 
     setProgress(25, 100);
     await preloadEditStates(plans.map(p => p.ch), `Chuẩn bị cập nhật ${sourceLabel}`);
@@ -1409,6 +1520,7 @@
     const parsed = [];
     let ignoredLines = 0;
     let filesWithIgnoredLines = 0;
+    const ignoredPreviews = [];
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const bundle = await parseTxtBundle(file, (pct, stage) => {
@@ -1420,11 +1532,20 @@
       if (bundle.ignored) {
         ignoredLines += bundle.ignored;
         filesWithIgnoredLines++;
-        debugLog(`${file.name}: bỏ qua ${bundle.ignored} dòng ngoài phần chương.`);
+        ignoredPreviews.push(`${file.name}:\n${bundle.ignoredLines.slice(0, 12).join('\n')}${bundle.ignoredLines.length > 12 ? '\n...' : ''}`);
+        debugLog(`${file.name}: phát hiện ${bundle.ignored} dòng ngoài phần chương.`);
       }
       await yieldBrowser();
     }
-    if (ignoredLines) log(`Đã bỏ qua ${ignoredLines} dòng nằm trước tiêu đề chương trong ${filesWithIgnoredLines} file TXT.`, 'warn');
+    if (ignoredLines) {
+      const proceed = await confirmModal(
+        'Phát hiện nội dung trước tiêu đề chương',
+        `Có ${ignoredLines} dòng trong ${filesWithIgnoredLines} file nằm trước tiêu đề “Chương X”.\n\n${ignoredPreviews.join('\n\n')}\n\nChỉ tiếp tục khi bạn xác nhận bỏ qua các dòng này.`,
+        'BỎ QUA VÀ TIẾP TỤC',
+      );
+      if (!proceed) return;
+      log(`Đã bỏ qua ${ignoredLines} dòng trước tiêu đề chương theo xác nhận của người dùng.`, 'warn');
+    }
     return applyParsedChapterUpdates(parsed, 'TXT');
   }
 
@@ -1595,18 +1716,35 @@
     log(`Đã xử lý chuyển thưởng cho ${done}/${rows.length} truyện.`, 'success');
   }
 
-  async function confirmModal(title, text, actionText='XÁC NHẬN') {
+  async function choiceModal(title, text, choices) {
     return new Promise(resolve => {
       const modal = document.querySelector('#tytb-modal');
       modal.querySelector('.tytb-modal-title').textContent = title;
       modal.querySelector('.tytb-modal-text').textContent = text;
-      const yes = modal.querySelector('.tytb-modal-yes');
-      const no = modal.querySelector('.tytb-modal-no');
-      yes.textContent = actionText;
+      const actions = modal.querySelector('.tytb-modal-actions');
+      actions.replaceChildren();
+      const finish = value => {
+        modal.classList.remove('show');
+        actions.replaceChildren();
+        resolve(value);
+      };
+      choices.forEach(choice => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = choice.text;
+        if (choice.className) button.className = choice.className;
+        button.onclick = () => finish(choice.value);
+        actions.appendChild(button);
+      });
       modal.classList.add('show');
-      const finish = value => { modal.classList.remove('show'); yes.onclick = null; no.onclick = null; resolve(value); };
-      yes.onclick = () => finish(true); no.onclick = () => finish(false);
     });
+  }
+
+  async function confirmModal(title, text, actionText='XÁC NHẬN') {
+    return choiceModal(title, text, [
+      { value: false, text: 'Hủy', className: '' },
+      { value: true, text: actionText, className: 'danger' },
+    ]);
   }
 
   function renderQueue() {
@@ -1636,7 +1774,7 @@
 #tytb-launch{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:0;border-radius:999px;background:#0d6efd;color:#fff;padding:10px 15px;font-weight:700;box-shadow:0 4px 18px #0008;cursor:pointer}
 #tytb-panel{position:fixed;right:12px;top:7vh;width:min(860px,calc(100vw - 24px));height:86vh;z-index:2147483647;background:#17191d;color:#e9ecef;border:1px solid #495057;border-radius:12px;box-shadow:0 12px 45px #000c;display:none;flex-direction:column;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
 #tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important}
-.tytb-session{display:grid;grid-template-columns:auto minmax(180px,1fr) auto;padding:7px 10px;gap:7px;border-bottom:1px solid #343a40}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40}.tytb-tabs button{flex:1}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-main{flex:1;min-height:0;overflow:auto;padding:9px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled{opacity:.45;cursor:not-allowed}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px}#tytb-panel input[type=number]{width:80px}#tytb-panel input[type=text]{min-width:210px}.tytb-file{flex:1;min-width:230px}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions .primary{min-width:110px}.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px}.tytb-table .note{width:120px}.tytb-queue{max-height:230px;overflow:auto;border:1px solid #343a40;border-radius:6px;padding:3px 6px}.tytb-queue:empty{display:none}.tytb-queue>div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #2d3135;padding:4px 1px}.tytb-queue>div:last-child{border-bottom:0}.tytb-queue button{padding:0 7px!important}.tytb-hint{color:#adb5bd;font-size:12px}.tytb-muted{color:#8f989f}.tytb-inline-title{font-weight:600}.tytb-details{border:1px solid #343a40;border-radius:7px;margin-top:7px;background:#191c20}.tytb-details>summary{cursor:pointer;padding:7px 9px;color:#cbd0d5;font-weight:600;user-select:none}.tytb-details[open]>summary{border-bottom:1px solid #343a40}.tytb-details-body{padding:7px 9px}.tytb-foot{border-top:1px solid #495057;background:#212529;padding:7px 10px}.tytb-statusline{display:flex;gap:9px;align-items:center}.tytb-statusline #tytb-status{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tytb-progress{height:6px;background:#343a40;border-radius:99px;overflow:hidden;margin-top:6px}.tytb-progress>div{height:100%;width:0;background:#0d6efd}.tytb-log-details{margin-top:5px}.tytb-log-details>summary{cursor:pointer;color:#adb5bd;font-size:12px}.tytb-log-head{display:flex;justify-content:flex-end;gap:5px;margin:5px 0}.tytb-log-head button{padding:2px 7px!important;font-size:11px}.tytb-log{height:110px;overflow:auto;background:#111418;border:1px solid #343a40;border-radius:6px;padding:3px 7px;font-size:12px}.tytb-log-entry{display:grid;grid-template-columns:55px 62px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid #252a2f}.tytb-log-entry:last-child{border-bottom:0}.tytb-log-time{color:#8d969f;font-variant-numeric:tabular-nums}.tytb-log-badge{font-size:9px;line-height:17px;text-align:center;border-radius:999px;background:#343a40}.tytb-log-message{min-width:0;overflow-wrap:anywhere}.tytb-log-success .tytb-log-badge{background:#1f6f43;color:#d8f3e5}.tytb-log-warn .tytb-log-badge{background:#765c10;color:#fff1b8}.tytb-log-error .tytb-log-badge{background:#842029;color:#ffd7da}.tytb-log-info .tytb-log-badge{background:#244f7a;color:#dbeeff}.tytb-log-error .tytb-log-message{color:#ffb4bb}.tytb-log-warn .tytb-log-message{color:#ffe08a}.tytb-log-success .tytb-log-message{color:#a9e8c5}.tytb-modal{position:fixed;inset:0;z-index:2147483647;background:#000b;display:none;align-items:center;justify-content:center}.tytb-modal.show{display:flex}.tytb-modal-card{width:min(720px,94vw);max-height:86vh;background:#1d2024;border:1px solid #6c757d;border-radius:10px;display:flex;flex-direction:column}.tytb-modal-title{font-weight:700;font-size:16px;padding:11px;border-bottom:1px solid #495057}.tytb-modal-text{white-space:pre-wrap;overflow:auto;padding:11px;min-height:90px}.tytb-modal-actions{display:flex;justify-content:flex-end;gap:8px;padding:9px;border-top:1px solid #495057}
+.tytb-session{display:grid;grid-template-columns:auto minmax(180px,1fr) auto;padding:7px 10px;gap:7px;border-bottom:1px solid #343a40}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40}.tytb-tabs button{flex:1}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-main{flex:1;min-height:0;overflow:auto;padding:9px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled{opacity:.45;cursor:not-allowed}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px}#tytb-panel input[type=number]{width:80px}#tytb-panel input[type=text]{min-width:210px}.tytb-file{flex:1;min-width:230px}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions .primary{min-width:110px}.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px}.tytb-table .note{width:120px}.tytb-queue{max-height:230px;overflow:auto;border:1px solid #343a40;border-radius:6px;padding:3px 6px}.tytb-queue:empty{display:none}.tytb-queue>div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #2d3135;padding:4px 1px}.tytb-queue>div:last-child{border-bottom:0}.tytb-queue button{padding:0 7px!important}.tytb-hint{color:#adb5bd;font-size:12px}.tytb-muted{color:#8f989f}.tytb-inline-title{font-weight:600}.tytb-details{border:1px solid #343a40;border-radius:7px;margin-top:7px;background:#191c20}.tytb-details>summary{cursor:pointer;padding:7px 9px;color:#cbd0d5;font-weight:600;user-select:none}.tytb-details[open]>summary{border-bottom:1px solid #343a40}.tytb-details-body{padding:7px 9px}.tytb-foot{border-top:1px solid #495057;background:#212529;padding:7px 10px}.tytb-author-note{margin-top:7px;padding-top:7px;border-top:1px solid #343a40;color:#adb5bd;font-size:11px;line-height:1.45;text-align:center}.tytb-author-note a{color:#8ab4f8;font-weight:700;text-decoration:none}.tytb-author-note a:hover{text-decoration:underline}.tytb-statusline{display:flex;gap:9px;align-items:center}.tytb-statusline #tytb-status{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tytb-progress{height:6px;background:#343a40;border-radius:99px;overflow:hidden;margin-top:6px}.tytb-progress>div{height:100%;width:0;background:#0d6efd}.tytb-log-details{margin-top:5px}.tytb-log-details>summary{cursor:pointer;color:#adb5bd;font-size:12px}.tytb-log-head{display:flex;justify-content:flex-end;gap:5px;margin:5px 0}.tytb-log-head button{padding:2px 7px!important;font-size:11px}.tytb-log{height:110px;overflow:auto;background:#111418;border:1px solid #343a40;border-radius:6px;padding:3px 7px;font-size:12px}.tytb-log-entry{display:grid;grid-template-columns:55px 62px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid #252a2f}.tytb-log-entry:last-child{border-bottom:0}.tytb-log-time{color:#8d969f;font-variant-numeric:tabular-nums}.tytb-log-badge{font-size:9px;line-height:17px;text-align:center;border-radius:999px;background:#343a40}.tytb-log-message{min-width:0;overflow-wrap:anywhere}.tytb-log-success .tytb-log-badge{background:#1f6f43;color:#d8f3e5}.tytb-log-warn .tytb-log-badge{background:#765c10;color:#fff1b8}.tytb-log-error .tytb-log-badge{background:#842029;color:#ffd7da}.tytb-log-info .tytb-log-badge{background:#244f7a;color:#dbeeff}.tytb-log-error .tytb-log-message{color:#ffb4bb}.tytb-log-warn .tytb-log-message{color:#ffe08a}.tytb-log-success .tytb-log-message{color:#a9e8c5}.tytb-modal{position:fixed;inset:0;z-index:2147483647;background:#000b;display:none;align-items:center;justify-content:center}.tytb-modal.show{display:flex}.tytb-modal-card{width:min(720px,94vw);max-height:86vh;background:#1d2024;border:1px solid #6c757d;border-radius:10px;display:flex;flex-direction:column}.tytb-modal-title{font-weight:700;font-size:16px;padding:11px;border-bottom:1px solid #495057}.tytb-modal-text{white-space:pre-wrap;overflow:auto;padding:11px;min-height:90px}.tytb-modal-actions{display:flex;justify-content:flex-end;gap:8px;padding:9px;border-top:1px solid #495057}.tytb-modal-actions button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:7px 10px;cursor:pointer}.tytb-modal-actions button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-modal-actions button.danger{background:#a52834;border-color:#c63c49}.tytb-modal-actions button.warn{background:#806509;border-color:#a8840b}
 @media(max-width:700px){#tytb-panel{right:2px;top:1vh;width:calc(100vw - 4px);height:98vh}.tytb-session{grid-template-columns:1fr auto}.tytb-session>[data-action="load-stories"]{grid-column:1/-1}.tytb-table .title{min-width:210px}.tytb-actions>*{flex:1}.tytb-tabs button{padding-left:4px!important;padding-right:4px!important}}
 `;
     document.head.appendChild(style);
@@ -1680,9 +1818,9 @@
       <div class="tytb-table-wrap"><table class="tytb-table"><thead><tr><th>Truyện</th>${earningCols.map(([,t])=>`<th>${t}</th>`).join('')}<th>Chuyển</th><th>Ghi chú</th></tr></thead><tbody id="tytb-earning-body"></tbody></table></div>
     </section>
   </div>
-  <div class="tytb-foot"><div class="tytb-statusline"><span id="tytb-status">Sẵn sàng.</span><span id="tytb-progress-text">0%</span><button id="tytb-cancel" disabled>Hủy</button></div><div class="tytb-progress"><div id="tytb-progress-bar"></div></div><details class="tytb-log-details"><summary>Nhật ký hoạt động</summary><div class="tytb-log-head"><button type="button" id="tytb-copy-log">Sao chép</button><button type="button" id="tytb-clear-log">Xóa</button></div><div id="tytb-log" class="tytb-log" aria-live="polite"></div></details></div>
+  <div class="tytb-foot"><div class="tytb-statusline"><span id="tytb-status">Sẵn sàng.</span><span id="tytb-progress-text">0%</span><button id="tytb-cancel" disabled>Hủy</button></div><div class="tytb-progress"><div id="tytb-progress-bar"></div></div><details class="tytb-log-details"><summary>Nhật ký hoạt động</summary><div class="tytb-log-head"><button type="button" id="tytb-copy-log">Sao chép</button><button type="button" id="tytb-clear-log">Xóa</button></div><div id="tytb-log" class="tytb-log" aria-live="polite"></div></details><div class="tytb-author-note">Script được viết bởi <a href="${escHtml(SCRIPT_INFO.authorProfileUrl)}" target="_blank" rel="noopener noreferrer">${escHtml(SCRIPT_INFO.authorName)}</a> - ${escHtml(SCRIPT_INFO.authorMessage)}</div></div>
 </div>
-<div id="tytb-modal" class="tytb-modal"><div class="tytb-modal-card"><div class="tytb-modal-title"></div><div class="tytb-modal-text"></div><div class="tytb-modal-actions"><button class="tytb-modal-no">Hủy</button><button class="tytb-modal-yes danger">Xác nhận</button></div></div></div>`);
+<div id="tytb-modal" class="tytb-modal"><div class="tytb-modal-card"><div class="tytb-modal-title"></div><div class="tytb-modal-text"></div><div class="tytb-modal-actions"></div></div></div>`);
 
     bindUI();
     const current = currentStoryIdFromUrl();
