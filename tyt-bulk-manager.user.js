@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.6.0
+// @version      1.6.1
 // @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, đổi tên, đánh số và thống kê doanh thu.
 // @author       GinKai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.6.0';
+  const VERSION = '1.6.1';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
   const CACHE_TTL = 60 * 1000;
@@ -1504,14 +1504,36 @@
       p.ch.note = `Đã cập nhật ${sourceLabel}`;
       okCount++;
       return { ok: true, p };
-    }, (done, total, result) => {
+    }, (done, total, result, index) => {
       setProgress(55 + Math.round(done * 45 / total), 100);
       setStatus(`Cập nhật ${sourceLabel}: ${done}/${total}`);
-      if (result?.error) debugLog(`Cập nhật ${sourceLabel} không thành công`, result.error, 'error');
+      if (result?.error) {
+        const failedPlan = plans[index];
+        const chapterNumber = failedPlan?.ch?.number ?? '?';
+        const chapterTitle = failedPlan?.title || failedPlan?.ch?.title || '';
+        const reason = friendlyError(result.error);
+        if (failedPlan?.ch) failedPlan.ch.note = `Lỗi cập nhật ${sourceLabel}: ${reason}`;
+        log(`Chương ${chapterNumber}${chapterTitle ? ` — ${chapterTitle}` : ''}: ${reason}`, 'error');
+        debugLog(`Cập nhật ${sourceLabel} không thành công ở chương ${chapterNumber}`, {
+          chapterNumber,
+          chapterTitle,
+          error: result.error,
+        }, 'error');
+      }
     });
     renderChapters();
-    const failed = results.filter(result => result?.error).length;
-    if (failed) throw new Error(`Cập nhật thành công ${okCount} chương, lỗi ${failed} chương.`);
+    const failures = results
+      .map((result, index) => result?.error ? { plan: plans[index], error: result.error } : null)
+      .filter(Boolean);
+    if (failures.length) {
+      const detail = failures.slice(0, 20).map(({ plan, error }) => {
+        const number = plan?.ch?.number ?? '?';
+        const title = plan?.title || plan?.ch?.title || '';
+        return `Chương ${number}${title ? ` — ${title}` : ''}: ${friendlyError(error)}`;
+      }).join('; ');
+      const more = failures.length > 20 ? `; và ${failures.length - 20} chương lỗi khác (xem nhật ký)` : '';
+      throw new Error(`Cập nhật thành công ${okCount} chương, lỗi ${failures.length} chương. ${detail}${more}`);
+    }
   }
 
   async function updateFromTxt(files) {
