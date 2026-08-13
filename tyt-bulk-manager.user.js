@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.6.1
+// @version      1.6.2
 // @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, đổi tên, đánh số và thống kê doanh thu.
-// @author       GinKai
+// @author       Gin Kai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
 // @supportURL   https://github.com/caccac11/TYT-Bulk-Manager/issues
 // @updateURL    https://raw.githubusercontent.com/caccac11/TYT-Bulk-Manager/main/tyt-bulk-manager.user.js
@@ -18,7 +18,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.6.1';
+  const VERSION = '1.6.2';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
   const CACHE_TTL = 60 * 1000;
@@ -30,7 +30,7 @@
   const CN_HEADING_RE = /^\s*第\s*([0-9]{1,6})\s*章\s*(.*?)\s*$/i;
   const BLANK_P = '<p>&nbsp;</p>';
   const SCRIPT_INFO = Object.freeze({
-    authorName: 'GinKai',
+    authorName: 'Gin Kai',
     authorProfileUrl: 'https://tytnovel.info/profile/68d1850877d97e06be011ae8',
     authorMessage: '1 Editor siêu flop trên TYT, nếu có thể thì hãy ghé qua đọc thử truyện của mình làm nhé~',
   });
@@ -68,6 +68,7 @@
     logs: [],
     activeRequests: new Set(),
     lastChapterSelectionIndex: null,
+    chapterViewPage: 1,
   };
 
   function loadConfig() {
@@ -507,8 +508,12 @@
     document.querySelectorAll('#tytb-panel button[data-action], #tytb-panel input[type=file], #tytb-story').forEach(el => {
       if (el.id !== 'tytb-cancel') el.disabled = !!busy;
     });
+    document.querySelectorAll('#tytb-panel label.tytb-file-picker').forEach(label => {
+      label.classList.toggle('disabled', !!busy);
+    });
     const cancel = document.querySelector('#tytb-cancel');
     if (cancel) cancel.disabled = !busy;
+    syncChapterPagerButtons();
   }
 
   function extractMaxPage(doc) {
@@ -777,6 +782,7 @@
     all.sort(chapterCompare);
     state.chapters = all;
     state.lastChapterSelectionIndex = null;
+    state.chapterViewPage = 1;
     state.chapterMeta = {
       expected,
       detectedPages: detected,
@@ -800,18 +806,73 @@
     return an - bn || a.title.localeCompare(b.title, 'vi');
   }
 
+  function chapterViewPageSize() {
+    const narrow = typeof matchMedia === 'function' && matchMedia('(max-width: 700px)').matches;
+    const coarse = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+    const shortTouch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse) and (max-height: 600px)').matches;
+    if (narrow || shortTouch) return 100;
+    if (coarse) return 160;
+    return 400;
+  }
+
+  function chapterViewMetrics() {
+    const total = state.chapters.length;
+    const pageSize = chapterViewPageSize();
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    state.chapterViewPage = clamp(Math.trunc(Number(state.chapterViewPage) || 1), 1, totalPages);
+    const start = total ? (state.chapterViewPage - 1) * pageSize : 0;
+    const end = Math.min(total, start + pageSize);
+    return { total, pageSize, totalPages, page: state.chapterViewPage, start, end };
+  }
+
+  function syncChapterPagerButtons(metrics = chapterViewMetrics()) {
+    const prev = document.querySelector('[data-action="chapter-prev"]');
+    const next = document.querySelector('[data-action="chapter-next"]');
+    if (prev) prev.disabled = state.busy || metrics.page <= 1 || metrics.total === 0;
+    if (next) next.disabled = state.busy || metrics.page >= metrics.totalPages || metrics.total === 0;
+  }
+
+  function setChapterViewPage(page) {
+    const metrics = chapterViewMetrics();
+    const next = clamp(Math.trunc(Number(page) || 1), 1, metrics.totalPages);
+    if (next === state.chapterViewPage && document.querySelector('#tytb-chapter-body')?.children.length) return;
+    state.chapterViewPage = next;
+    renderChapters();
+    document.querySelector('#tytb-chapter-pager')?.scrollIntoView({ block: 'nearest', behavior: 'auto' });
+  }
+
   function renderChapters() {
     const body = document.querySelector('#tytb-chapter-body');
     const info = document.querySelector('#tytb-chapter-info');
+    const pager = document.querySelector('#tytb-chapter-pager');
+    const pagerText = document.querySelector('#tytb-chapter-page-info');
     if (!body) return;
-    body.innerHTML = state.chapters.map((ch, i) => `<tr data-cid="${ch.chapterId}">
-      <td><input class="tytb-chk" type="checkbox" ${ch.selected ? 'checked' : ''}></td>
-      <td class="num">${ch.number ?? ''}</td><td class="title">${escHtml(ch.title)}</td>
-      <td class="note">${escHtml(ch.note || '')}</td></tr>`).join('');
+
+    const metrics = chapterViewMetrics();
+    const visible = state.chapters.slice(metrics.start, metrics.end);
+    body.innerHTML = visible.map((ch, offset) => {
+      const index = metrics.start + offset;
+      return `<tr data-cid="${ch.chapterId}" data-index="${index}">
+        <td class="check"><input class="tytb-chk" type="checkbox" aria-label="Chọn chương ${ch.number ?? index + 1}" ${ch.selected ? 'checked' : ''}></td>
+        <td class="num">${ch.number ?? ''}</td><td class="title">${escHtml(ch.title)}</td>
+        <td class="note">${escHtml(ch.note || '')}</td></tr>`;
+    }).join('');
+
+    const selectedCount = state.chapters.reduce((count, ch) => count + (ch.selected ? 1 : 0), 0);
     if (info) {
       const m = state.chapterMeta;
-      info.textContent = m ? `${state.chapters.length} chương | trang ${m.loadedPages}/${m.detectedPages}${m.complete ? '' : ' | CHƯA TẢI ĐỦ'}${m.countMismatch ? ` | bộ đếm web: ${m.expected}` : ''}` : 'Chưa tải';
+      info.textContent = m
+        ? `${metrics.total} chương | đã chọn ${selectedCount} | trang nguồn ${m.loadedPages}/${m.detectedPages}${m.complete ? '' : ' | CHƯA TẢI ĐỦ'}${m.countMismatch ? ` | bộ đếm web: ${m.expected}` : ''}`
+        : (metrics.total ? `${metrics.total} chương | đã chọn ${selectedCount}` : 'Chưa tải');
     }
+
+    if (pager) pager.hidden = metrics.total <= metrics.pageSize;
+    if (pagerText) {
+      pagerText.textContent = metrics.total
+        ? `${metrics.start + 1}–${metrics.end} / ${metrics.total} • Trang ${metrics.page}/${metrics.totalPages}`
+        : '0 chương';
+    }
+    syncChapterPagerButtons(metrics);
   }
 
   function parseFormFields(doc) {
@@ -1786,33 +1847,47 @@
     state.cfg.readWorkers = intVal('#tytb-read-workers', state.cfg.readWorkers, 1, 8);
     state.cfg.writeWorkers = intVal('#tytb-write-workers', state.cfg.writeWorkers, 1, 4);
     state.cfg.writeDelay = intVal('#tytb-write-delay', state.cfg.writeDelay, 50, 2000);
+    state.cfg.panelWidth = intVal('#tytb-panel-width', state.cfg.panelWidth, 720, 1400);
     state.cfg.selectedOnly = !!document.querySelector('#tytb-selected-only')?.checked;
+    const panel = document.querySelector('#tytb-panel');
+    if (panel) panel.style.setProperty('--tytb-panel-width', `${state.cfg.panelWidth}px`);
     saveConfig();
   }
 
   function injectUI() {
     const style = document.createElement('style');
     style.textContent = `
-#tytb-launch{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:0;border-radius:999px;background:#0d6efd;color:#fff;padding:10px 15px;font-weight:700;box-shadow:0 4px 18px #0008;cursor:pointer}
-#tytb-panel{position:fixed;right:12px;top:7vh;width:min(860px,calc(100vw - 24px));height:86vh;z-index:2147483647;background:#17191d;color:#e9ecef;border:1px solid #495057;border-radius:12px;box-shadow:0 12px 45px #000c;display:none;flex-direction:column;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
-#tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important}
-.tytb-session{display:grid;grid-template-columns:auto minmax(180px,1fr) auto;padding:7px 10px;gap:7px;border-bottom:1px solid #343a40}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40}.tytb-tabs button{flex:1}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-main{flex:1;min-height:0;overflow:auto;padding:9px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled{opacity:.45;cursor:not-allowed}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px}#tytb-panel input[type=number]{width:80px}#tytb-panel input[type=text]{min-width:210px}.tytb-file{flex:1;min-width:230px}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions .primary{min-width:110px}.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px}.tytb-table .note{width:120px}.tytb-queue{max-height:230px;overflow:auto;border:1px solid #343a40;border-radius:6px;padding:3px 6px}.tytb-queue:empty{display:none}.tytb-queue>div{display:flex;justify-content:space-between;gap:10px;border-bottom:1px solid #2d3135;padding:4px 1px}.tytb-queue>div:last-child{border-bottom:0}.tytb-queue button{padding:0 7px!important}.tytb-hint{color:#adb5bd;font-size:12px}.tytb-muted{color:#8f989f}.tytb-inline-title{font-weight:600}.tytb-details{border:1px solid #343a40;border-radius:7px;margin-top:7px;background:#191c20}.tytb-details>summary{cursor:pointer;padding:7px 9px;color:#cbd0d5;font-weight:600;user-select:none}.tytb-details[open]>summary{border-bottom:1px solid #343a40}.tytb-details-body{padding:7px 9px}.tytb-foot{border-top:1px solid #495057;background:#212529;padding:7px 10px}.tytb-author-note{margin-top:7px;padding-top:7px;border-top:1px solid #343a40;color:#adb5bd;font-size:11px;line-height:1.45;text-align:center}.tytb-author-note a{color:#8ab4f8;font-weight:700;text-decoration:none}.tytb-author-note a:hover{text-decoration:underline}.tytb-statusline{display:flex;gap:9px;align-items:center}.tytb-statusline #tytb-status{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tytb-progress{height:6px;background:#343a40;border-radius:99px;overflow:hidden;margin-top:6px}.tytb-progress>div{height:100%;width:0;background:#0d6efd}.tytb-log-details{margin-top:5px}.tytb-log-details>summary{cursor:pointer;color:#adb5bd;font-size:12px}.tytb-log-head{display:flex;justify-content:flex-end;gap:5px;margin:5px 0}.tytb-log-head button{padding:2px 7px!important;font-size:11px}.tytb-log{height:110px;overflow:auto;background:#111418;border:1px solid #343a40;border-radius:6px;padding:3px 7px;font-size:12px}.tytb-log-entry{display:grid;grid-template-columns:55px 62px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid #252a2f}.tytb-log-entry:last-child{border-bottom:0}.tytb-log-time{color:#8d969f;font-variant-numeric:tabular-nums}.tytb-log-badge{font-size:9px;line-height:17px;text-align:center;border-radius:999px;background:#343a40}.tytb-log-message{min-width:0;overflow-wrap:anywhere}.tytb-log-success .tytb-log-badge{background:#1f6f43;color:#d8f3e5}.tytb-log-warn .tytb-log-badge{background:#765c10;color:#fff1b8}.tytb-log-error .tytb-log-badge{background:#842029;color:#ffd7da}.tytb-log-info .tytb-log-badge{background:#244f7a;color:#dbeeff}.tytb-log-error .tytb-log-message{color:#ffb4bb}.tytb-log-warn .tytb-log-message{color:#ffe08a}.tytb-log-success .tytb-log-message{color:#a9e8c5}.tytb-modal{position:fixed;inset:0;z-index:2147483647;background:#000b;display:none;align-items:center;justify-content:center}.tytb-modal.show{display:flex}.tytb-modal-card{width:min(720px,94vw);max-height:86vh;background:#1d2024;border:1px solid #6c757d;border-radius:10px;display:flex;flex-direction:column}.tytb-modal-title{font-weight:700;font-size:16px;padding:11px;border-bottom:1px solid #495057}.tytb-modal-text{white-space:pre-wrap;overflow:auto;padding:11px;min-height:90px}.tytb-modal-actions{display:flex;justify-content:flex-end;gap:8px;padding:9px;border-top:1px solid #495057}.tytb-modal-actions button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:7px 10px;cursor:pointer}.tytb-modal-actions button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-modal-actions button.danger{background:#a52834;border-color:#c63c49}.tytb-modal-actions button.warn{background:#806509;border-color:#a8840b}
-@media(max-width:700px){#tytb-panel{right:2px;top:1vh;width:calc(100vw - 4px);height:98vh}.tytb-session{grid-template-columns:1fr auto}.tytb-session>[data-action="load-stories"]{grid-column:1/-1}.tytb-table .title{min-width:210px}.tytb-actions>*{flex:1}.tytb-tabs button{padding-left:4px!important;padding-right:4px!important}}
+#tytb-launch{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:0;border-radius:999px;background:#0d6efd;color:#fff;padding:10px 15px;font-weight:700;box-shadow:0 4px 18px #0008;cursor:pointer;touch-action:manipulation}
+#tytb-panel{--tytb-panel-width:1040px;position:fixed;right:12px;top:7vh;width:min(var(--tytb-panel-width),calc(100vw - 24px));height:86vh;height:86dvh;z-index:2147483647;background:#17191d;color:#e9ecef;border:1px solid #495057;border-radius:12px;box-shadow:0 12px 45px #000c;display:none;flex-direction:column;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;overscroll-behavior:contain}
+#tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box;min-inline-size:0}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045;flex:0 0 auto}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important;flex:0 0 auto}
+.tytb-session{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"refresh story open";padding:7px 10px;gap:7px;border-bottom:1px solid #343a40;flex:0 0 auto}.tytb-session>[data-action="load-stories"]{grid-area:refresh}.tytb-session #tytb-story{grid-area:story;width:100%;min-width:0}.tytb-session>[data-action="open-story"]{grid-area:open}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.tytb-tabs::-webkit-scrollbar{display:none}.tytb-tabs button{flex:1 0 auto;white-space:nowrap}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-tab-label-short{display:none}
+.tytb-main{flex:1;min-height:0;overflow:auto;padding:9px;overscroll-behavior:contain;scroll-padding-bottom:18px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1;min-width:0}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer;touch-action:manipulation}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled,.tytb-btn.disabled{opacity:.45;cursor:not-allowed;pointer-events:none}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px;max-width:100%}#tytb-panel input[type=number]{width:84px;flex:0 0 auto}#tytb-panel input[type=text]{min-width:0}.tytb-row label.grow input[type=text]{width:100%}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions>*{min-width:0}.tytb-actions .primary{min-width:110px}.tytb-file-picker{display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.tytb-upload-picker .tytb-hint{flex:1 1 180px}
+.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px;overflow-wrap:anywhere}.tytb-table .note{width:120px;overflow-wrap:anywhere}.tytb-table .num{font-variant-numeric:tabular-nums}.tytb-chapter-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin:7px 0}.tytb-chapter-pager[hidden]{display:none}.tytb-chapter-page-info{min-width:180px;text-align:center;color:#adb5bd;font-size:12px;font-variant-numeric:tabular-nums}
+.tytb-queue{max-height:230px;overflow:auto;border:1px solid #343a40;border-radius:6px;padding:3px 6px;overscroll-behavior:contain}.tytb-queue:empty{display:none}.tytb-queue>div{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid #2d3135;padding:4px 1px}.tytb-queue>div:last-child{border-bottom:0}.tytb-queue>div>span{flex:1;min-width:0;overflow-wrap:anywhere;word-break:break-word}.tytb-queue button{padding:0 7px!important;flex:0 0 auto}.tytb-hint{color:#adb5bd;font-size:12px;overflow-wrap:anywhere}.tytb-muted{color:#8f989f}.tytb-inline-title{font-weight:600}.tytb-details{border:1px solid #343a40;border-radius:7px;margin-top:7px;background:#191c20}.tytb-details>summary{cursor:pointer;padding:7px 9px;color:#cbd0d5;font-weight:600;user-select:none}.tytb-details[open]>summary{border-bottom:1px solid #343a40}.tytb-details-body{padding:7px 9px}
+.tytb-foot{border-top:1px solid #495057;background:#212529;padding:7px 10px;flex:0 0 auto}.tytb-statusline{display:flex;gap:9px;align-items:center}.tytb-statusline #tytb-status{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tytb-progress{height:6px;background:#343a40;border-radius:99px;overflow:hidden;margin-top:6px}.tytb-progress>div{height:100%;width:0;background:#0d6efd}.tytb-log-details{margin-top:5px}.tytb-log-details>summary{cursor:pointer;color:#adb5bd;font-size:12px}.tytb-log-head{display:flex;justify-content:flex-end;gap:5px;margin:5px 0}.tytb-log-head button{padding:2px 7px!important;font-size:11px}.tytb-log{height:110px;overflow:auto;background:#111418;border:1px solid #343a40;border-radius:6px;padding:3px 7px;font-size:12px;overscroll-behavior:contain}.tytb-log-entry{display:grid;grid-template-columns:55px 62px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid #252a2f}.tytb-log-entry:last-child{border-bottom:0}.tytb-log-time{color:#8d969f;font-variant-numeric:tabular-nums}.tytb-log-badge{font-size:9px;line-height:17px;text-align:center;border-radius:999px;background:#343a40}.tytb-log-message{min-width:0;overflow-wrap:anywhere}.tytb-log-success .tytb-log-badge{background:#1f6f43;color:#d8f3e5}.tytb-log-warn .tytb-log-badge{background:#765c10;color:#fff1b8}.tytb-log-error .tytb-log-badge{background:#842029;color:#ffd7da}.tytb-log-info .tytb-log-badge{background:#244f7a;color:#dbeeff}.tytb-log-error .tytb-log-message{color:#ffb4bb}.tytb-log-warn .tytb-log-message{color:#ffe08a}.tytb-log-success .tytb-log-message{color:#a9e8c5}
+.tytb-author-note{margin-top:7px;padding-top:7px;border-top:1px solid #343a40;color:#adb5bd;font-size:11px;line-height:1.45;text-align:center;overflow-wrap:anywhere}.tytb-author-note a{color:#8ab4f8;font-weight:700;text-decoration:none}.tytb-author-note a:hover{text-decoration:underline}.tytb-author-name{position:relative;display:inline-block;isolation:isolate;animation:tytb-glitch-main 5.6s infinite}.tytb-author-name::before,.tytb-author-name::after{content:attr(data-text);position:absolute;inset:0;pointer-events:none;opacity:0}.tytb-author-name::before{color:#ff5f7a}.tytb-author-name::after{color:#66d9ff}@keyframes tytb-glitch-main{0%,90%,95%,100%{transform:none;text-shadow:none;opacity:1}91%{transform:translateX(-1px);text-shadow:1px 0 #ff5f7a,-1px 0 #66d9ff}92%{transform:translateX(1px);opacity:.65}93%{transform:translateX(-1px);text-shadow:-1px 0 #ff5f7a,1px 0 #66d9ff}94%{transform:none;opacity:1}}@keyframes tytb-glitch-before{0%,90%,95%,100%{opacity:0;transform:none}91%{opacity:.75;transform:translate(-1px,-1px);clip-path:inset(0 0 55% 0)}92%{opacity:.2;transform:translate(1px,0);clip-path:inset(45% 0 20% 0)}93%{opacity:.7;transform:translate(-1px,1px);clip-path:inset(70% 0 0 0)}94%{opacity:0}}@keyframes tytb-glitch-after{0%,90%,95%,100%{opacity:0;transform:none}91%{opacity:.45;transform:translate(1px,1px);clip-path:inset(60% 0 0 0)}92%{opacity:.7;transform:translate(-1px,0);clip-path:inset(20% 0 55% 0)}93%{opacity:.25;transform:translate(1px,-1px);clip-path:inset(40% 0 25% 0)}94%{opacity:0}}.tytb-author-name::before{animation:tytb-glitch-before 5.6s infinite}.tytb-author-name::after{animation:tytb-glitch-after 5.6s infinite}
+.tytb-modal{position:fixed;inset:0;z-index:2147483647;background:#000b;display:none;align-items:center;justify-content:center;padding:12px}.tytb-modal.show{display:flex}.tytb-modal-card{width:min(720px,94vw);max-height:86vh;max-height:86dvh;background:#1d2024;border:1px solid #6c757d;border-radius:10px;display:flex;flex-direction:column;overflow:hidden}.tytb-modal-title{font-weight:700;font-size:16px;padding:11px;border-bottom:1px solid #495057;flex:0 0 auto}.tytb-modal-text{white-space:pre-wrap;overflow:auto;padding:11px;min-height:90px;min-width:0;flex:1 1 auto;overflow-wrap:anywhere;overscroll-behavior:contain}.tytb-modal-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;padding:9px;border-top:1px solid #495057;flex:0 0 auto}.tytb-modal-actions button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:7px 10px;cursor:pointer}.tytb-modal-actions button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-modal-actions button.danger{background:#a52834;border-color:#c63c49}.tytb-modal-actions button.warn{background:#806509;border-color:#a8840b}
+@media(max-width:900px){#tytb-panel{right:8px;top:4vh;width:calc(100vw - 16px);height:92vh;height:92dvh}.tytb-details-body .tytb-row>label{flex:1 1 220px}.tytb-row .grow{min-width:0}.tytb-table .title{min-width:240px}}
+@media(max-width:700px),(hover:none) and (pointer:coarse) and (max-height:600px){#tytb-panel{inset:0;width:100%;height:100vh;height:100dvh;border:0;border-radius:0}.tytb-head{padding-top:max(8px,env(safe-area-inset-top));padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}.tytb-foot{padding-bottom:max(8px,env(safe-area-inset-bottom));padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}#tytb-launch{right:max(14px,env(safe-area-inset-right));bottom:max(14px,env(safe-area-inset-bottom))}}
+@media(max-width:700px){.tytb-session{grid-template-columns:1fr 1fr;grid-template-areas:"story story" "refresh open";padding:7px}.tytb-session>[data-action]{width:100%}.tytb-main{padding:7px}.tytb-box{padding:7px}.tytb-row:not(.compact)>label{flex:1 1 100%;justify-content:space-between}.tytb-row:not(.compact)>label.grow{display:grid;grid-template-columns:auto minmax(0,1fr)}.tytb-details-body .tytb-row:not(.compact)>button{flex:1 1 120px}.tytb-actions>*{flex:1 1 calc(50% - 7px)}#tytb-panel input[type=text],#tytb-panel select{min-width:0;max-width:100%}.tytb-upload-picker .tytb-file-picker{flex:1 1 120px}.tytb-upload-picker .tytb-hint{flex:1 1 100%}.tytb-chapter-wrap{max-height:none;overflow:visible;border:0}.tytb-chapter-wrap #tytb-chapter-table,.tytb-chapter-wrap #tytb-chapter-body{display:block;width:100%}.tytb-chapter-wrap #tytb-chapter-table thead{display:none}.tytb-chapter-wrap #tytb-chapter-body{display:grid;gap:7px}.tytb-chapter-wrap #tytb-chapter-body tr{display:grid;grid-template-columns:38px 58px minmax(0,1fr);grid-template-rows:auto auto;width:100%;border:1px solid #343a40;border-radius:8px;background:#1e2125;overflow:hidden}.tytb-chapter-wrap #tytb-chapter-body td{display:block;width:auto;min-width:0;border:0;padding:6px}.tytb-chapter-wrap #tytb-chapter-body td.check{grid-column:1;grid-row:1/3;display:flex;align-items:center;justify-content:center;border-right:1px solid #343a40}.tytb-chapter-wrap #tytb-chapter-body td.num{grid-column:2;grid-row:1;font-weight:700;color:#cbd0d5;white-space:nowrap}.tytb-chapter-wrap #tytb-chapter-body td.num::before{content:'#';color:#747d85}.tytb-chapter-wrap #tytb-chapter-body td.title{grid-column:3;grid-row:1;min-width:0;font-weight:600;overflow-wrap:anywhere}.tytb-chapter-wrap #tytb-chapter-body td.note{grid-column:2/4;grid-row:2;color:#adb5bd;font-size:11px;border-top:1px solid #2d3135;overflow-wrap:anywhere}.tytb-chapter-wrap #tytb-chapter-body td.note:empty{display:none}.tytb-chapter-pager{justify-content:space-between}.tytb-chapter-page-info{min-width:0;flex:1}.tytb-earning-wrap{max-height:58vh;max-height:58dvh}.tytb-earning-wrap #tytb-earning-table{width:max-content;min-width:100%}.tytb-earning-wrap #tytb-earning-table th:first-child,.tytb-earning-wrap #tytb-earning-table td:first-child{position:sticky;left:0;min-width:150px;max-width:220px;overflow-wrap:anywhere}.tytb-earning-wrap #tytb-earning-table th:first-child{z-index:3;background:#2b3035}.tytb-earning-wrap #tytb-earning-table td:first-child{z-index:2;background:#1e2125}.tytb-modal{padding:8px}.tytb-modal-card{width:100%;max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px)}.tytb-modal-actions button{flex:1 1 140px;min-height:42px}.tytb-statusline{display:grid;grid-template-columns:minmax(0,1fr) auto auto}.tytb-log-entry{grid-template-columns:50px 58px minmax(0,1fr);gap:5px}}
+@media(max-width:430px){.tytb-tab-label-long{display:none}.tytb-tab-label-short{display:inline}.tytb-main{padding:5px}.tytb-box{padding:6px;margin-bottom:6px}.tytb-tabs{padding:5px;gap:4px}.tytb-tabs button{padding-left:6px!important;padding-right:6px!important}.tytb-details-body{padding:6px}.tytb-actions{gap:6px}.tytb-chapter-pager{gap:5px}.tytb-chapter-pager button{padding-left:7px!important;padding-right:7px!important}.tytb-modal-actions{flex-direction:column-reverse}.tytb-modal-actions button{width:100%;flex:none}.tytb-author-note{font-size:10.5px}.tytb-log-entry{grid-template-columns:47px 54px minmax(0,1fr);gap:4px}}
+@media(pointer:coarse){#tytb-panel button,.tytb-btn,#tytb-panel select,#tytb-panel input[type=number],.tytb-details>summary{min-height:42px}.tytb-chk{width:20px;height:20px}.tytb-close{min-width:42px}.tytb-file-picker{min-height:42px}}
+@media(prefers-reduced-motion:reduce){.tytb-author-name,.tytb-author-name::before,.tytb-author-name::after{animation:none!important}.tytb-author-name::before,.tytb-author-name::after{display:none}}
 `;
     document.head.appendChild(style);
 
     document.body.insertAdjacentHTML('beforeend', `
-<button id="tytb-launch">TYT Bulk</button>
-<div id="tytb-panel">
-  <div class="tytb-head"><b>TYT Bulk</b><span class="grow" id="tytb-current-story">Chưa chọn truyện</span><span class="tytb-muted">v${VERSION}</span><button class="tytb-close" id="tytb-close" title="Đóng">×</button></div>
-  <div class="tytb-session"><button data-action="load-stories">Làm mới</button><select id="tytb-story"><option>Chưa nạp danh sách truyện</option></select><button data-action="open-story">Mở</button></div>
-  <div class="tytb-tabs"><button class="active" data-tab="upload">Đăng TXT</button><button data-tab="chapters">Quản lý chương</button><button data-tab="earning">Doanh thu</button></div>
+<button id="tytb-launch" type="button">TYT Bulk</button>
+<div id="tytb-panel" role="dialog" aria-label="TYT Bulk Manager" style="--tytb-panel-width:${clamp(state.cfg.panelWidth, 720, 1400)}px">
+  <div class="tytb-head"><b>TYT Bulk</b><span class="grow" id="tytb-current-story">Chưa chọn truyện</span><span class="tytb-muted">v${VERSION}</span><button class="tytb-close" id="tytb-close" type="button" title="Đóng" aria-label="Đóng">×</button></div>
+  <div class="tytb-session"><button type="button" data-action="load-stories">Làm mới</button><select id="tytb-story"><option>Chưa nạp danh sách truyện</option></select><button type="button" data-action="open-story">Mở</button></div>
+  <div class="tytb-tabs"><button type="button" class="active" data-tab="upload"><span class="tytb-tab-label-long">Đăng TXT</span><span class="tytb-tab-label-short">Đăng</span></button><button type="button" data-tab="chapters"><span class="tytb-tab-label-long">Quản lý chương</span><span class="tytb-tab-label-short">Chương</span></button><button type="button" data-tab="earning">Doanh thu</button></div>
   <div class="tytb-main">
     <section class="tytb-tab active" data-pane="upload">
       <div class="tytb-box">
-        <div class="tytb-row"><input id="tytb-upload-files" class="tytb-file" type="file" accept=".txt,text/plain" multiple><button data-action="clear-queue">Xóa danh sách</button></div>
+        <div class="tytb-row tytb-upload-picker"><label class="tytb-btn primary tytb-file-picker">Chọn TXT<input id="tytb-upload-files" type="file" accept=".txt,text/plain" multiple hidden></label><span class="tytb-hint">Chọn một hoặc nhiều file TXT.</span><button type="button" data-action="clear-queue">Xóa danh sách</button></div>
         <div class="tytb-row"><label>Số bắt đầu <input id="tytb-upload-start" type="number" min="1" max="9999" value="1"></label><label>Hiển thị <select id="tytb-published"><option value="1" ${state.cfg.published==='1'?'selected':''}>Công khai</option><option value="0" ${state.cfg.published==='0'?'selected':''}>Riêng tư</option></select></label><span id="tytb-queue-count" class="tytb-hint">0 chương trong hàng chờ</span></div>
-        <div class="tytb-actions"><button class="primary" data-action="upload-next">Đăng 10 chương</button><button class="primary" data-action="upload-all">Đăng tất cả</button></div>
+        <div class="tytb-actions"><button type="button" class="primary" data-action="upload-next">Đăng 10 chương</button><button type="button" class="primary" data-action="upload-all">Đăng tất cả</button></div>
         <details class="tytb-details"><summary>Tùy chọn đăng</summary><div class="tytb-details-body"><div class="tytb-row compact"><label><input id="tytb-parse-number" type="checkbox" ${state.cfg.parseNumberFromFilename?'checked':''}> Lấy số từ tên file</label><label><input id="tytb-single-upload" type="checkbox" ${state.cfg.singleUpload?'checked':''}> Đăng từng chương</label></div><div class="tytb-hint">TXT gộp sẽ tự tách theo dòng “Chương X: Tiêu đề”.</div></div></details>
         <div id="tytb-queue" class="tytb-queue"></div>
       </div>
@@ -1820,33 +1895,36 @@
 
     <section class="tytb-tab" data-pane="chapters">
       <div class="tytb-box">
-        <div class="tytb-row"><button class="primary" data-action="load-chapters">Tải danh sách</button><button data-action="open-chapters">Mở trên web</button><span id="tytb-chapter-info" class="tytb-hint">Chưa tải</span></div>
-        <div class="tytb-row compact"><button data-action="select-all">Chọn tất</button><button data-action="select-none">Bỏ chọn</button><button data-action="select-invert">Đảo chọn</button><label><input id="tytb-selected-only" type="checkbox" ${state.cfg.selectedOnly?'checked':''}> Chỉ chương đã chọn</label></div>
-        <div class="tytb-actions"><label class="tytb-btn primary">Cập nhật từ TXT<input id="tytb-update-txt-files" type="file" accept=".txt,text/plain" multiple hidden></label><button data-action="download-txt">Tải TXT</button><button class="danger" data-action="delete">Xóa đã chọn</button></div>
+        <div class="tytb-row"><button type="button" class="primary" data-action="load-chapters">Tải danh sách</button><button type="button" data-action="open-chapters">Mở trên web</button><span id="tytb-chapter-info" class="tytb-hint">Chưa tải</span></div>
+        <div class="tytb-row compact"><button type="button" data-action="select-all">Chọn tất</button><button type="button" data-action="select-none">Bỏ chọn</button><button type="button" data-action="select-invert">Đảo chọn</button><label><input id="tytb-selected-only" type="checkbox" ${state.cfg.selectedOnly?'checked':''}> Chỉ chương đã chọn</label></div>
+        <div class="tytb-actions"><label class="tytb-btn primary tytb-file-picker">Cập nhật từ TXT<input id="tytb-update-txt-files" type="file" accept=".txt,text/plain" multiple hidden></label><button type="button" data-action="download-txt">Tải TXT</button><button type="button" class="danger" data-action="delete">Xóa đã chọn</button></div>
         <details class="tytb-details"><summary>Đổi tên và đánh số</summary><div class="tytb-details-body">
-          <div class="tytb-row"><label>Bắt đầu <input id="tytb-renumber-start" type="number" value="${state.cfg.renumberStart}" min="1" max="9999"></label><button class="primary" data-action="renumber">Đánh số lại</button></div>
-          <div class="tytb-row"><label class="grow">Mẫu tên <input id="tytb-rename-template" class="grow" type="text" value="${escHtml(state.cfg.renameTemplate)}"></label><button data-action="rename-reset">Mặc định</button><button class="primary" data-action="rename">Đổi tên</button></div>
+          <div class="tytb-row"><label>Bắt đầu <input id="tytb-renumber-start" type="number" value="${state.cfg.renumberStart}" min="1" max="9999"></label><button type="button" class="primary" data-action="renumber">Đánh số lại</button></div>
+          <div class="tytb-row"><label class="grow">Mẫu tên <input id="tytb-rename-template" class="grow" type="text" value="${escHtml(state.cfg.renameTemplate)}"></label><button type="button" data-action="rename-reset">Mặc định</button><button type="button" class="primary" data-action="rename">Đổi tên</button></div>
         </div></details>
-        <details class="tytb-details"><summary>Giới hạn tải và tốc độ</summary><div class="tytb-details-body">
+        <details class="tytb-details"><summary>Giới hạn tải, tốc độ và giao diện</summary><div class="tytb-details-body">
           <div class="tytb-row"><label>Tối đa trang <input id="tytb-max-pages" type="number" value="${state.cfg.maxPages}" min="1" max="500"></label><label>Tối đa chương <input id="tytb-max-items" type="number" value="${state.cfg.maxItems}" min="1" max="20000"></label></div>
-          <div class="tytb-row"><label>Luồng đọc <input id="tytb-read-workers" type="number" value="${state.cfg.readWorkers}" min="1" max="8"></label><label>Luồng ghi <input id="tytb-write-workers" type="number" value="${state.cfg.writeWorkers}" min="1" max="4"></label><label>Nghỉ ghi <input id="tytb-write-delay" type="number" value="${state.cfg.writeDelay}" min="50" max="2000"> ms</label><button data-action="save-settings">Lưu</button></div>
+          <div class="tytb-row"><label>Luồng đọc <input id="tytb-read-workers" type="number" value="${state.cfg.readWorkers}" min="1" max="8"></label><label>Luồng ghi <input id="tytb-write-workers" type="number" value="${state.cfg.writeWorkers}" min="1" max="4"></label><label>Nghỉ ghi <input id="tytb-write-delay" type="number" value="${state.cfg.writeDelay}" min="50" max="2000"> ms</label></div>
+          <div class="tytb-row"><label>Rộng panel desktop <input id="tytb-panel-width" type="number" value="${clamp(state.cfg.panelWidth,720,1400)}" min="720" max="1400"> px</label><button type="button" data-action="save-settings">Lưu</button></div>
         </div></details>
       </div>
-      <div class="tytb-table-wrap"><table class="tytb-table"><thead><tr><th></th><th>Số</th><th>Tiêu đề</th><th>Trạng thái</th></tr></thead><tbody id="tytb-chapter-body"></tbody></table></div>
+      <div id="tytb-chapter-pager" class="tytb-chapter-pager" hidden><button type="button" data-action="chapter-prev">‹ Trước</button><span id="tytb-chapter-page-info" class="tytb-chapter-page-info"></span><button type="button" data-action="chapter-next">Sau ›</button></div>
+      <div class="tytb-table-wrap tytb-chapter-wrap"><table id="tytb-chapter-table" class="tytb-table"><thead><tr><th></th><th>Số</th><th>Tiêu đề</th><th>Trạng thái</th></tr></thead><tbody id="tytb-chapter-body"></tbody></table></div>
     </section>
 
     <section class="tytb-tab" data-pane="earning">
-      <div class="tytb-box"><div class="tytb-actions"><button data-action="earning-selected">Truyện đang chọn</button><button class="primary" data-action="earning-all">Tất cả truyện</button><button class="warn tytb-btn" data-action="withdraw-all">Chuyển thưởng</button><button data-action="earning-clear">Xóa bảng</button></div><div id="tytb-earning-summary" class="tytb-hint">Chưa có dữ liệu.</div></div>
-      <div class="tytb-table-wrap"><table class="tytb-table"><thead><tr><th>Truyện</th>${earningCols.map(([,t])=>`<th>${t}</th>`).join('')}<th>Chuyển</th><th>Ghi chú</th></tr></thead><tbody id="tytb-earning-body"></tbody></table></div>
+      <div class="tytb-box"><div class="tytb-actions"><button type="button" data-action="earning-selected">Truyện đang chọn</button><button type="button" class="primary" data-action="earning-all">Tất cả truyện</button><button type="button" class="warn tytb-btn" data-action="withdraw-all">Chuyển thưởng</button><button type="button" data-action="earning-clear">Xóa bảng</button></div><div id="tytb-earning-summary" class="tytb-hint">Chưa có dữ liệu.</div></div>
+      <div class="tytb-table-wrap tytb-earning-wrap"><table id="tytb-earning-table" class="tytb-table"><thead><tr><th>Truyện</th>${earningCols.map(([,t])=>`<th>${t}</th>`).join('')}<th>Chuyển</th><th>Ghi chú</th></tr></thead><tbody id="tytb-earning-body"></tbody></table></div>
     </section>
   </div>
-  <div class="tytb-foot"><div class="tytb-statusline"><span id="tytb-status">Sẵn sàng.</span><span id="tytb-progress-text">0%</span><button id="tytb-cancel" disabled>Hủy</button></div><div class="tytb-progress"><div id="tytb-progress-bar"></div></div><details class="tytb-log-details"><summary>Nhật ký hoạt động</summary><div class="tytb-log-head"><button type="button" id="tytb-copy-log">Sao chép</button><button type="button" id="tytb-clear-log">Xóa</button></div><div id="tytb-log" class="tytb-log" aria-live="polite"></div></details><div class="tytb-author-note">Script được viết bởi <a href="${escHtml(SCRIPT_INFO.authorProfileUrl)}" target="_blank" rel="noopener noreferrer">${escHtml(SCRIPT_INFO.authorName)}</a> - ${escHtml(SCRIPT_INFO.authorMessage)}</div></div>
+  <div class="tytb-foot"><div class="tytb-statusline"><span id="tytb-status">Sẵn sàng.</span><span id="tytb-progress-text">0%</span><button id="tytb-cancel" type="button" disabled>Hủy</button></div><div class="tytb-progress"><div id="tytb-progress-bar"></div></div><details class="tytb-log-details"><summary>Nhật ký hoạt động</summary><div class="tytb-log-head"><button type="button" id="tytb-copy-log">Sao chép</button><button type="button" id="tytb-clear-log">Xóa</button></div><div id="tytb-log" class="tytb-log" aria-live="polite"></div></details><div class="tytb-author-note">Script được viết bởi <a class="tytb-author-name" data-text="${escHtml(SCRIPT_INFO.authorName)}" href="${escHtml(SCRIPT_INFO.authorProfileUrl)}" target="_blank" rel="noopener noreferrer">${escHtml(SCRIPT_INFO.authorName)}</a> - ${escHtml(SCRIPT_INFO.authorMessage)}</div></div>
 </div>
 <div id="tytb-modal" class="tytb-modal"><div class="tytb-modal-card"><div class="tytb-modal-title"></div><div class="tytb-modal-text"></div><div class="tytb-modal-actions"></div></div></div>`);
 
     bindUI();
     const current = currentStoryIdFromUrl();
     if (current) { state.storyId = current; state.storyTitle = current; }
+    renderChapters();
     log(`TYT Bulk v${VERSION} đã sẵn sàng.`, 'success');
     document.addEventListener('visibilitychange', () => {
       if (!state.busy) return;
@@ -1861,7 +1939,7 @@
 
   function bindUI() {
     const panel = document.querySelector('#tytb-panel');
-    document.querySelector('#tytb-launch').onclick = () => panel.classList.toggle('show');
+    document.querySelector('#tytb-launch').onclick = () => { panel.classList.toggle('show'); if (panel.classList.contains('show')) renderChapters(); };
     document.querySelector('#tytb-close').onclick = () => panel.classList.remove('show');
     document.querySelector('#tytb-copy-log').onclick = () => copyActivityLog();
     document.querySelector('#tytb-clear-log').onclick = () => clearActivityLog();
@@ -1876,11 +1954,12 @@
       btn.onclick = () => {
         document.querySelectorAll('.tytb-tabs button').forEach(x=>x.classList.toggle('active',x===btn));
         document.querySelectorAll('.tytb-tab').forEach(x=>x.classList.toggle('active',x.dataset.pane===btn.dataset.tab));
+        if (btn.dataset.tab === 'chapters') renderChapters();
       };
     });
     document.querySelector('#tytb-story').onchange = e => {
       state.storyId = e.target.value; state.storyTitle = state.stories.find(x=>x.id===state.storyId)?.title || state.storyId;
-      state.chapters=[]; state.chapterMeta=null; state.editCache.clear(); state.lastChapterSelectionIndex=null; renderChapters(); renderStorySelect();
+      state.chapters=[]; state.chapterMeta=null; state.editCache.clear(); state.lastChapterSelectionIndex=null; state.chapterViewPage=1; renderChapters(); renderStorySelect();
     };
     document.querySelector('#tytb-upload-files').onchange = async e => {
       const input = e.target;
@@ -1927,10 +2006,11 @@
     document.querySelector('#tytb-chapter-body').onclick = e => {
       const checkbox = e.target.closest('input.tytb-chk');
       if (!checkbox) return;
-      const tr = checkbox.closest('tr[data-cid]');
+      const tr = checkbox.closest('tr[data-cid][data-index]');
       if (!tr) return;
-      const currentIndex = state.chapters.findIndex(ch => ch.chapterId === tr.dataset.cid);
-      if (currentIndex < 0) return;
+      const currentIndex = Number(tr.dataset.index);
+      if (!Number.isInteger(currentIndex) || currentIndex < 0 || currentIndex >= state.chapters.length) return;
+      if (state.chapters[currentIndex]?.chapterId !== tr.dataset.cid) return;
 
       const checked = checkbox.checked;
       const anchorIndex = state.lastChapterSelectionIndex;
@@ -1938,20 +2018,21 @@
         const from = Math.min(anchorIndex, currentIndex);
         const to = Math.max(anchorIndex, currentIndex);
         for (let i = from; i <= to; i++) state.chapters[i].selected = checked;
-
-        const rows = document.querySelectorAll('#tytb-chapter-body tr[data-cid]');
-        for (let i = from; i <= to; i++) {
-          const rangeCheckbox = rows[i]?.querySelector('input.tytb-chk');
-          if (rangeCheckbox) rangeCheckbox.checked = checked;
-        }
+        renderChapters();
         debugLog(`Đã ${checked ? 'chọn' : 'bỏ chọn'} ${to - from + 1} chương bằng Shift.`);
       } else {
         state.chapters[currentIndex].selected = checked;
+        const info = document.querySelector('#tytb-chapter-info');
+        const m = state.chapterMeta;
+        const selectedCount = state.chapters.reduce((count, ch) => count + (ch.selected ? 1 : 0), 0);
+        if (info) info.textContent = m
+          ? `${state.chapters.length} chương | đã chọn ${selectedCount} | trang nguồn ${m.loadedPages}/${m.detectedPages}${m.complete ? '' : ' | CHƯA TẢI ĐỦ'}${m.countMismatch ? ` | bộ đếm web: ${m.expected}` : ''}`
+          : `${state.chapters.length} chương | đã chọn ${selectedCount}`;
       }
       state.lastChapterSelectionIndex = currentIndex;
     };
     document.querySelector('#tytb-update-txt-files').onchange = e => { const files=[...e.target.files]; e.target.value=''; if(files.length) runTask('Cập nhật nội dung từ TXT',()=>updateFromTxt(files)); };
-    panel.addEventListener('change', e => { if (['tytb-selected-only','tytb-max-pages','tytb-max-items','tytb-read-workers','tytb-write-workers','tytb-write-delay'].includes(e.target.id)) readSettingsFromUI(); });
+    panel.addEventListener('change', e => { if (['tytb-selected-only','tytb-max-pages','tytb-max-items','tytb-read-workers','tytb-write-workers','tytb-write-delay','tytb-panel-width'].includes(e.target.id)) readSettingsFromUI(); });
     panel.addEventListener('click', e => {
       const btn=e.target.closest('[data-action]'); if(!btn)return;
       const a=btn.dataset.action;
@@ -1967,6 +2048,8 @@
         'earning-clear':()=>{state.earnings.clear();state.wallet=null;renderEarnings();},
         'open-chapters':()=>{if(state.storyId)window.open(`/mystory/${state.storyId}/chapters`,'_blank');},
         'load-chapters':()=>{readSettingsFromUI();runTask('Tải danh sách chương',loadChapters);},
+        'chapter-prev':()=>setChapterViewPage(state.chapterViewPage - 1),
+        'chapter-next':()=>setChapterViewPage(state.chapterViewPage + 1),
         'select-all':()=>{state.chapters.forEach(x=>{x.selected=true;});state.lastChapterSelectionIndex=null;renderChapters();},
         'select-none':()=>{state.chapters.forEach(x=>{x.selected=false;});state.lastChapterSelectionIndex=null;renderChapters();},
         'select-invert':()=>{state.chapters.forEach(x=>{x.selected=!x.selected;});state.lastChapterSelectionIndex=null;renderChapters();},
@@ -1978,6 +2061,20 @@
         'save-settings':()=>{readSettingsFromUI();alert('Đã lưu cài đặt.');},
       };
       actions[a]?.();
+    });
+
+    const chapterLayoutQueries = typeof matchMedia === 'function' ? [
+      matchMedia('(max-width: 700px)'),
+      matchMedia('(pointer: coarse)'),
+      matchMedia('(pointer: coarse) and (max-height: 600px)'),
+    ] : [];
+    const onChapterLayoutChange = () => {
+      if (!document.querySelector('#tytb-panel')?.classList.contains('show')) return;
+      renderChapters();
+    };
+    chapterLayoutQueries.forEach(query => {
+      if (typeof query.addEventListener === 'function') query.addEventListener('change', onChapterLayoutChange);
+      else if (typeof query.addListener === 'function') query.addListener(onChapterLayoutChange);
     });
   }
 
