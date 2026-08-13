@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.6.2
+// @version      1.6.3
 // @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, đổi tên, đánh số và thống kê doanh thu.
 // @author       Gin Kai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
@@ -13,12 +13,15 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_notification
+// @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
+// @connect      raw.githubusercontent.com
 // ==/UserScript==
 
 (() => {
   'use strict';
 
-  const VERSION = '1.6.2';
+  const VERSION = '1.6.3';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
   const CACHE_TTL = 60 * 1000;
@@ -33,6 +36,17 @@
     authorName: 'Gin Kai',
     authorProfileUrl: 'https://tytnovel.info/profile/68d1850877d97e06be011ae8',
     authorMessage: '1 Editor siêu flop trên TYT, nếu có thể thì hãy ghé qua đọc thử truyện của mình làm nhé~',
+  });
+
+
+  const UPDATE_INFO = Object.freeze({
+    checkUrl: 'https://raw.githubusercontent.com/caccac11/TYT-Bulk-Manager/main/tyt-bulk-manager.user.js',
+    downloadUrl: 'https://raw.githubusercontent.com/caccac11/TYT-Bulk-Manager/main/tyt-bulk-manager.user.js',
+    cacheKey: 'tyt_bulk_update_cache_v1',
+    notifiedKey: 'tyt_bulk_update_notified_version',
+    cacheMs: 30 * 60 * 1000,
+    failCacheMs: 5 * 60 * 1000,
+    timeoutMs: 15000,
   });
 
   const defaults = {
@@ -82,6 +96,185 @@
 
   function saveConfig() {
     try { GM_setValue('tyt_bulk_browser_config', state.cfg); } catch (_) {}
+  }
+
+
+  function versionParts(value) {
+    return String(value || '')
+      .trim()
+      .replace(/^v/i, '')
+      .split(/[^0-9]+/)
+      .filter(Boolean)
+      .map(x => Number(x) || 0);
+  }
+
+  function compareVersions(a, b) {
+    const aa = versionParts(a), bb = versionParts(b);
+    const length = Math.max(aa.length, bb.length);
+    for (let i = 0; i < length; i++) {
+      const av = aa[i] || 0, bv = bb[i] || 0;
+      if (av !== bv) return av > bv ? 1 : -1;
+    }
+    return 0;
+  }
+
+  function isNewerVersion(remoteVersion, localVersion = VERSION) {
+    return compareVersions(remoteVersion, localVersion) > 0;
+  }
+
+  function readUpdateCache() {
+    try {
+      const cached = GM_getValue(UPDATE_INFO.cacheKey, null);
+      return cached && typeof cached === 'object' ? cached : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function writeUpdateCache(remoteVersion, ok) {
+    try {
+      GM_setValue(UPDATE_INFO.cacheKey, {
+        checkedAt: Date.now(),
+        remoteVersion: String(remoteVersion || ''),
+        ok: !!ok,
+      });
+    } catch (_) {}
+  }
+
+  function renderUpdateStatus(remoteVersion = '') {
+    const badge = document.querySelector('#tytb-update-badge');
+    const versionEl = document.querySelector('#tytb-version');
+    const panel = document.querySelector('#tytb-panel');
+    const newer = isNewerVersion(remoteVersion);
+    panel?.classList.toggle('tytb-has-update', newer);
+    if (versionEl) {
+      versionEl.title = newer
+        ? `Đang dùng v${VERSION}; có bản mới v${remoteVersion}.`
+        : `Phiên bản hiện tại v${VERSION}.`;
+    }
+    if (!badge) return newer;
+    badge.hidden = !newer;
+    badge.dataset.version = newer ? String(remoteVersion) : '';
+    badge.title = newer ? `Cập nhật TYT Bulk từ v${VERSION} lên v${remoteVersion}` : '';
+    const longLabel = badge.querySelector('.tytb-update-long');
+    if (longLabel) longLabel.textContent = newer ? `v${remoteVersion} mới` : 'Có bản mới';
+    return newer;
+  }
+
+  function notifyUpdateOnce(remoteVersion) {
+    if (!isNewerVersion(remoteVersion)) return;
+    let previous = '';
+    try { previous = String(GM_getValue(UPDATE_INFO.notifiedKey, '') || ''); } catch (_) {}
+    if (previous === String(remoteVersion)) return;
+    try { GM_setValue(UPDATE_INFO.notifiedKey, String(remoteVersion)); } catch (_) {}
+    if (typeof GM_notification === 'function') {
+      try {
+        GM_notification({
+          title: 'TYT Bulk có bản mới',
+          text: `v${VERSION} → v${remoteVersion}. Mở panel và bấm “Cập nhật” để cài.`,
+          timeout: 9000,
+        });
+      } catch (_) {}
+    }
+  }
+
+  function requestRemoteVersion() {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest không khả dụng.'));
+        return;
+      }
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: UPDATE_INFO.checkUrl,
+        headers: { Accept: 'text/plain,*/*;q=0.8' },
+        timeout: UPDATE_INFO.timeoutMs,
+        onload: response => {
+          const status = Number(response?.status) || 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(`Máy chủ cập nhật trả HTTP ${status || '?'}.`));
+            return;
+          }
+          const text = String(response?.responseText || '');
+          const match = text.match(/^\s*\/\/\s*@version\s+([^\s]+)\s*$/m);
+          if (!match) {
+            reject(new Error('Không đọc được @version từ bản cập nhật.'));
+            return;
+          }
+          resolve(match[1].trim());
+        },
+        ontimeout: () => reject(new Error('Kiểm tra cập nhật bị quá thời gian.')),
+        onerror: () => reject(new Error('Không kết nối được máy chủ cập nhật.')),
+      });
+    });
+  }
+
+  async function checkForUpdates({ force = false, userInitiated = false } = {}) {
+    if (!force) {
+      const cached = readUpdateCache();
+      if (cached?.checkedAt) {
+        const ttl = cached.ok ? UPDATE_INFO.cacheMs : UPDATE_INFO.failCacheMs;
+        if (Date.now() - Number(cached.checkedAt) < ttl) {
+          const remoteVersion = String(cached.remoteVersion || '');
+          const newer = renderUpdateStatus(remoteVersion);
+          if (newer) notifyUpdateOnce(remoteVersion);
+          return remoteVersion;
+        }
+      }
+    }
+
+    if (userInitiated) setStatus('Đang kiểm tra cập nhật...');
+    try {
+      const remoteVersion = await requestRemoteVersion();
+      writeUpdateCache(remoteVersion, true);
+      const newer = renderUpdateStatus(remoteVersion);
+      if (newer) {
+        log(`Có bản cập nhật v${remoteVersion}. Bấm “Cập nhật” trên thanh tiêu đề để cài.`, 'warn');
+        notifyUpdateOnce(remoteVersion);
+        if (userInitiated) alert(`Có bản mới v${remoteVersion}.
+
+Bản hiện tại: v${VERSION}.
+Bấm “Cập nhật” trên thanh tiêu đề để mở trình cài của Tampermonkey.`);
+      } else if (userInitiated) {
+        log(`Đang dùng bản mới nhất v${VERSION}.`, 'success');
+        alert(`Bạn đang dùng bản mới nhất: v${VERSION}.`);
+      }
+      return remoteVersion;
+    } catch (error) {
+      writeUpdateCache('', false);
+      debugLog('Kiểm tra cập nhật không thành công', error, 'warn');
+      if (userInitiated) alert(`Không kiểm tra được cập nhật.
+
+${friendlyError(error)}`);
+      return '';
+    } finally {
+      if (userInitiated && !state.busy) setStatus('Sẵn sàng.');
+    }
+  }
+
+  async function openUpdateInstaller() {
+    if (state.busy) {
+      alert('Hãy chờ tác vụ hiện tại hoàn tất hoặc hủy tác vụ trước khi cập nhật script.');
+      return;
+    }
+    let remoteVersion = document.querySelector('#tytb-update-badge')?.dataset.version || '';
+    if (!isNewerVersion(remoteVersion)) {
+      remoteVersion = await checkForUpdates({ force: true, userInitiated: true });
+    }
+    if (!isNewerVersion(remoteVersion)) return;
+    try {
+      if (typeof GM_openInTab === 'function') {
+        GM_openInTab(UPDATE_INFO.downloadUrl, { active: true, insert: true, setParent: true });
+      } else {
+        const opened = window.open(UPDATE_INFO.downloadUrl, '_blank');
+        if (!opened) throw new Error('Popup bị chặn.');
+        try { opened.opener = null; } catch (_) {}
+      }
+      log(`Đã mở trình cài bản v${remoteVersion}. Tampermonkey sẽ xử lý bước cập nhật tiếp theo.`, 'info');
+    } catch (error) {
+      debugLog('Không mở được trình cài cập nhật', error, 'warn');
+      alert('Không mở được trình cài cập nhật. Hãy cho phép mở tab mới rồi thử lại.');
+    }
   }
 
   const backgroundTimer = (() => {
@@ -1859,7 +2052,7 @@
     style.textContent = `
 #tytb-launch{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:0;border-radius:999px;background:#0d6efd;color:#fff;padding:10px 15px;font-weight:700;box-shadow:0 4px 18px #0008;cursor:pointer;touch-action:manipulation}
 #tytb-panel{--tytb-panel-width:1040px;position:fixed;right:12px;top:7vh;width:min(var(--tytb-panel-width),calc(100vw - 24px));height:86vh;height:86dvh;z-index:2147483647;background:#17191d;color:#e9ecef;border:1px solid #495057;border-radius:12px;box-shadow:0 12px 45px #000c;display:none;flex-direction:column;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden;overscroll-behavior:contain}
-#tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box;min-inline-size:0}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045;flex:0 0 auto}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important;flex:0 0 auto}
+#tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box;min-inline-size:0}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045;flex:0 0 auto}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-version{flex:0 0 auto}.tytb-update-badge{flex:0 0 auto;border:1px solid #4ea3ff!important;background:#123b66!important;color:#dceeff!important;border-radius:999px!important;padding:3px 8px!important;font-size:10.5px!important;font-weight:800;line-height:1.25;box-shadow:0 0 0 0 rgba(78,163,255,.35);animation:tytb-update-pulse 2.2s ease-in-out infinite}.tytb-update-badge[hidden]{display:none!important}.tytb-update-short{display:none}@keyframes tytb-update-pulse{0%,100%{box-shadow:0 0 0 0 rgba(78,163,255,0)}50%{box-shadow:0 0 0 4px rgba(78,163,255,.12)}}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important;flex:0 0 auto}
 .tytb-session{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"refresh story open";padding:7px 10px;gap:7px;border-bottom:1px solid #343a40;flex:0 0 auto}.tytb-session>[data-action="load-stories"]{grid-area:refresh}.tytb-session #tytb-story{grid-area:story;width:100%;min-width:0}.tytb-session>[data-action="open-story"]{grid-area:open}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.tytb-tabs::-webkit-scrollbar{display:none}.tytb-tabs button{flex:1 0 auto;white-space:nowrap}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-tab-label-short{display:none}
 .tytb-main{flex:1;min-height:0;overflow:auto;padding:9px;overscroll-behavior:contain;scroll-padding-bottom:18px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1;min-width:0}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer;touch-action:manipulation}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled,.tytb-btn.disabled{opacity:.45;cursor:not-allowed;pointer-events:none}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px;max-width:100%}#tytb-panel input[type=number]{width:84px;flex:0 0 auto}#tytb-panel input[type=text]{min-width:0}.tytb-row label.grow input[type=text]{width:100%}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions>*{min-width:0}.tytb-actions .primary{min-width:110px}.tytb-file-picker{display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.tytb-upload-picker .tytb-hint{flex:1 1 180px}
 .tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px;overflow-wrap:anywhere}.tytb-table .note{width:120px;overflow-wrap:anywhere}.tytb-table .num{font-variant-numeric:tabular-nums}.tytb-chapter-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin:7px 0}.tytb-chapter-pager[hidden]{display:none}.tytb-chapter-page-info{min-width:180px;text-align:center;color:#adb5bd;font-size:12px;font-variant-numeric:tabular-nums}
@@ -1870,16 +2063,16 @@
 @media(max-width:900px){#tytb-panel{right:8px;top:4vh;width:calc(100vw - 16px);height:92vh;height:92dvh}.tytb-details-body .tytb-row>label{flex:1 1 220px}.tytb-row .grow{min-width:0}.tytb-table .title{min-width:240px}}
 @media(max-width:700px),(hover:none) and (pointer:coarse) and (max-height:600px){#tytb-panel{inset:0;width:100%;height:100vh;height:100dvh;border:0;border-radius:0}.tytb-head{padding-top:max(8px,env(safe-area-inset-top));padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}.tytb-foot{padding-bottom:max(8px,env(safe-area-inset-bottom));padding-left:max(8px,env(safe-area-inset-left));padding-right:max(8px,env(safe-area-inset-right))}#tytb-launch{right:max(14px,env(safe-area-inset-right));bottom:max(14px,env(safe-area-inset-bottom))}}
 @media(max-width:700px){.tytb-session{grid-template-columns:1fr 1fr;grid-template-areas:"story story" "refresh open";padding:7px}.tytb-session>[data-action]{width:100%}.tytb-main{padding:7px}.tytb-box{padding:7px}.tytb-row:not(.compact)>label{flex:1 1 100%;justify-content:space-between}.tytb-row:not(.compact)>label.grow{display:grid;grid-template-columns:auto minmax(0,1fr)}.tytb-details-body .tytb-row:not(.compact)>button{flex:1 1 120px}.tytb-actions>*{flex:1 1 calc(50% - 7px)}#tytb-panel input[type=text],#tytb-panel select{min-width:0;max-width:100%}.tytb-upload-picker .tytb-file-picker{flex:1 1 120px}.tytb-upload-picker .tytb-hint{flex:1 1 100%}.tytb-chapter-wrap{max-height:none;overflow:visible;border:0}.tytb-chapter-wrap #tytb-chapter-table,.tytb-chapter-wrap #tytb-chapter-body{display:block;width:100%}.tytb-chapter-wrap #tytb-chapter-table thead{display:none}.tytb-chapter-wrap #tytb-chapter-body{display:grid;gap:7px}.tytb-chapter-wrap #tytb-chapter-body tr{display:grid;grid-template-columns:38px 58px minmax(0,1fr);grid-template-rows:auto auto;width:100%;border:1px solid #343a40;border-radius:8px;background:#1e2125;overflow:hidden}.tytb-chapter-wrap #tytb-chapter-body td{display:block;width:auto;min-width:0;border:0;padding:6px}.tytb-chapter-wrap #tytb-chapter-body td.check{grid-column:1;grid-row:1/3;display:flex;align-items:center;justify-content:center;border-right:1px solid #343a40}.tytb-chapter-wrap #tytb-chapter-body td.num{grid-column:2;grid-row:1;font-weight:700;color:#cbd0d5;white-space:nowrap}.tytb-chapter-wrap #tytb-chapter-body td.num::before{content:'#';color:#747d85}.tytb-chapter-wrap #tytb-chapter-body td.title{grid-column:3;grid-row:1;min-width:0;font-weight:600;overflow-wrap:anywhere}.tytb-chapter-wrap #tytb-chapter-body td.note{grid-column:2/4;grid-row:2;color:#adb5bd;font-size:11px;border-top:1px solid #2d3135;overflow-wrap:anywhere}.tytb-chapter-wrap #tytb-chapter-body td.note:empty{display:none}.tytb-chapter-pager{justify-content:space-between}.tytb-chapter-page-info{min-width:0;flex:1}.tytb-earning-wrap{max-height:58vh;max-height:58dvh}.tytb-earning-wrap #tytb-earning-table{width:max-content;min-width:100%}.tytb-earning-wrap #tytb-earning-table th:first-child,.tytb-earning-wrap #tytb-earning-table td:first-child{position:sticky;left:0;min-width:150px;max-width:220px;overflow-wrap:anywhere}.tytb-earning-wrap #tytb-earning-table th:first-child{z-index:3;background:#2b3035}.tytb-earning-wrap #tytb-earning-table td:first-child{z-index:2;background:#1e2125}.tytb-modal{padding:8px}.tytb-modal-card{width:100%;max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px)}.tytb-modal-actions button{flex:1 1 140px;min-height:42px}.tytb-statusline{display:grid;grid-template-columns:minmax(0,1fr) auto auto}.tytb-log-entry{grid-template-columns:50px 58px minmax(0,1fr);gap:5px}}
-@media(max-width:430px){.tytb-tab-label-long{display:none}.tytb-tab-label-short{display:inline}.tytb-main{padding:5px}.tytb-box{padding:6px;margin-bottom:6px}.tytb-tabs{padding:5px;gap:4px}.tytb-tabs button{padding-left:6px!important;padding-right:6px!important}.tytb-details-body{padding:6px}.tytb-actions{gap:6px}.tytb-chapter-pager{gap:5px}.tytb-chapter-pager button{padding-left:7px!important;padding-right:7px!important}.tytb-modal-actions{flex-direction:column-reverse}.tytb-modal-actions button{width:100%;flex:none}.tytb-author-note{font-size:10.5px}.tytb-log-entry{grid-template-columns:47px 54px minmax(0,1fr);gap:4px}}
+@media(max-width:430px){.tytb-tab-label-long{display:none}.tytb-tab-label-short{display:inline}.tytb-update-long{display:none}.tytb-update-short{display:inline}#tytb-panel.tytb-has-update #tytb-version{display:none}.tytb-main{padding:5px}.tytb-box{padding:6px;margin-bottom:6px}.tytb-tabs{padding:5px;gap:4px}.tytb-tabs button{padding-left:6px!important;padding-right:6px!important}.tytb-details-body{padding:6px}.tytb-actions{gap:6px}.tytb-chapter-pager{gap:5px}.tytb-chapter-pager button{padding-left:7px!important;padding-right:7px!important}.tytb-modal-actions{flex-direction:column-reverse}.tytb-modal-actions button{width:100%;flex:none}.tytb-author-note{font-size:10.5px}.tytb-log-entry{grid-template-columns:47px 54px minmax(0,1fr);gap:4px}}
 @media(pointer:coarse){#tytb-panel button,.tytb-btn,#tytb-panel select,#tytb-panel input[type=number],.tytb-details>summary{min-height:42px}.tytb-chk{width:20px;height:20px}.tytb-close{min-width:42px}.tytb-file-picker{min-height:42px}}
-@media(prefers-reduced-motion:reduce){.tytb-author-name,.tytb-author-name::before,.tytb-author-name::after{animation:none!important}.tytb-author-name::before,.tytb-author-name::after{display:none}}
+@media(prefers-reduced-motion:reduce){.tytb-author-name,.tytb-author-name::before,.tytb-author-name::after,.tytb-update-badge{animation:none!important}.tytb-author-name::before,.tytb-author-name::after{display:none}}
 `;
     document.head.appendChild(style);
 
     document.body.insertAdjacentHTML('beforeend', `
 <button id="tytb-launch" type="button">TYT Bulk</button>
 <div id="tytb-panel" role="dialog" aria-label="TYT Bulk Manager" style="--tytb-panel-width:${clamp(state.cfg.panelWidth, 720, 1400)}px">
-  <div class="tytb-head"><b>TYT Bulk</b><span class="grow" id="tytb-current-story">Chưa chọn truyện</span><span class="tytb-muted">v${VERSION}</span><button class="tytb-close" id="tytb-close" type="button" title="Đóng" aria-label="Đóng">×</button></div>
+  <div class="tytb-head"><b>TYT Bulk</b><span class="grow" id="tytb-current-story">Chưa chọn truyện</span><span class="tytb-muted tytb-version" id="tytb-version">v${VERSION}</span><button class="tytb-update-badge" id="tytb-update-badge" type="button" data-action="install-update" hidden><span class="tytb-update-long">Có bản mới</span><span class="tytb-update-short">Mới</span></button><button class="tytb-close" id="tytb-close" type="button" title="Đóng" aria-label="Đóng">×</button></div>
   <div class="tytb-session"><button type="button" data-action="load-stories">Làm mới</button><select id="tytb-story"><option>Chưa nạp danh sách truyện</option></select><button type="button" data-action="open-story">Mở</button></div>
   <div class="tytb-tabs"><button type="button" class="active" data-tab="upload"><span class="tytb-tab-label-long">Đăng TXT</span><span class="tytb-tab-label-short">Đăng</span></button><button type="button" data-tab="chapters"><span class="tytb-tab-label-long">Quản lý chương</span><span class="tytb-tab-label-short">Chương</span></button><button type="button" data-tab="earning">Doanh thu</button></div>
   <div class="tytb-main">
@@ -1905,7 +2098,7 @@
         <details class="tytb-details"><summary>Giới hạn tải, tốc độ và giao diện</summary><div class="tytb-details-body">
           <div class="tytb-row"><label>Tối đa trang <input id="tytb-max-pages" type="number" value="${state.cfg.maxPages}" min="1" max="500"></label><label>Tối đa chương <input id="tytb-max-items" type="number" value="${state.cfg.maxItems}" min="1" max="20000"></label></div>
           <div class="tytb-row"><label>Luồng đọc <input id="tytb-read-workers" type="number" value="${state.cfg.readWorkers}" min="1" max="8"></label><label>Luồng ghi <input id="tytb-write-workers" type="number" value="${state.cfg.writeWorkers}" min="1" max="4"></label><label>Nghỉ ghi <input id="tytb-write-delay" type="number" value="${state.cfg.writeDelay}" min="50" max="2000"> ms</label></div>
-          <div class="tytb-row"><label>Rộng panel desktop <input id="tytb-panel-width" type="number" value="${clamp(state.cfg.panelWidth,720,1400)}" min="720" max="1400"> px</label><button type="button" data-action="save-settings">Lưu</button></div>
+          <div class="tytb-row"><label>Rộng panel desktop <input id="tytb-panel-width" type="number" value="${clamp(state.cfg.panelWidth,720,1400)}" min="720" max="1400"> px</label><button type="button" data-action="save-settings">Lưu</button><button type="button" data-action="check-update">Kiểm tra cập nhật</button></div><div class="tytb-hint">Tự kiểm tra bản mới khi khởi động; kết quả được lưu 30 phút để tránh gọi GitHub liên tục.</div>
         </div></details>
       </div>
       <div id="tytb-chapter-pager" class="tytb-chapter-pager" hidden><button type="button" data-action="chapter-prev">‹ Trước</button><span id="tytb-chapter-page-info" class="tytb-chapter-page-info"></span><button type="button" data-action="chapter-next">Sau ›</button></div>
@@ -1926,6 +2119,7 @@
     if (current) { state.storyId = current; state.storyTitle = current; }
     renderChapters();
     log(`TYT Bulk v${VERSION} đã sẵn sàng.`, 'success');
+    queueMicrotask(() => { checkForUpdates().catch(error => debugLog('Startup update check', error, 'warn')); });
     document.addEventListener('visibilitychange', () => {
       if (!state.busy) return;
       debugLog(document.hidden ? 'Tab chuyển sang nền.' : 'Tab trở lại tiền cảnh.');
@@ -2050,6 +2244,8 @@
         'load-chapters':()=>{readSettingsFromUI();runTask('Tải danh sách chương',loadChapters);},
         'chapter-prev':()=>setChapterViewPage(state.chapterViewPage - 1),
         'chapter-next':()=>setChapterViewPage(state.chapterViewPage + 1),
+        'check-update':()=>checkForUpdates({ force: true, userInitiated: true }),
+        'install-update':()=>openUpdateInstaller(),
         'select-all':()=>{state.chapters.forEach(x=>{x.selected=true;});state.lastChapterSelectionIndex=null;renderChapters();},
         'select-none':()=>{state.chapters.forEach(x=>{x.selected=false;});state.lastChapterSelectionIndex=null;renderChapters();},
         'select-invert':()=>{state.chapters.forEach(x=>{x.selected=!x.selected;});state.lastChapterSelectionIndex=null;renderChapters();},
