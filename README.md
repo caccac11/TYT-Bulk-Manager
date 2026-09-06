@@ -49,4 +49,4 @@ Mở mục [Issues](https://github.com/caccac11/TYT-Bulk-Manager/issues) và cun
 
 ## Phiên bản hiện tại
 
-`1.5.1`
+`1.6.5`
