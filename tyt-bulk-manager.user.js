@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.6.4
+// @version      1.6.5
 // @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, Retry riêng chương lỗi, đổi tên, đánh số và thống kê doanh thu.
 // @author       Gin Kai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.6.4';
+  const VERSION = '1.6.5';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
   const CACHE_TTL = 60 * 1000;
@@ -834,6 +834,7 @@ ${friendlyError(error)}`);
 
   function parseChapterRows(doc, pageNo) {
     const out = [];
+    const seenRows = new Set();
     for (const table of doc.querySelectorAll('table')) {
       if (!table.querySelector('a[href*="/chapters/"][href*="/edit"]')) continue;
       let numberIndex = null, best = -1;
@@ -853,6 +854,9 @@ ${friendlyError(error)}`);
         const cid = match[2];
         // Không trộn chương của truyện khác nếu trang có widget/bảng phụ.
         if (ID_RE.test(state.storyId) && rowStoryId !== state.storyId) continue;
+        const rowKey = `${rowStoryId}:${cid}`;
+        if (seenRows.has(rowKey)) continue;
+        seenRows.add(rowKey);
         const exactEditUrl = `${editUrlObj.pathname}${editUrlObj.search}`;
         const cells = [...tr.children].filter(x => /^(TD|TH)$/.test(x.tagName));
         let number = null, numberSource = '';
@@ -891,43 +895,37 @@ ${friendlyError(error)}`);
         });
       }
     }
-    const seen = new Set();
-    return out.filter(x => !seen.has(`${x.storyId}:${x.chapterId}`) && seen.add(`${x.storyId}:${x.chapterId}`));
+    return out;
   }
 
   async function fetchChapterListPage(root, pageNo, expectedMinRows = 1) {
     const url = urlWithPage(root, pageNo);
-    let lastError = null;
-    for (let pass = 0; pass < 3; pass++) {
-      try {
-        const { text } = await requestText(url, {
-          retries: 4,
-          retryStatuses: [404, 408, 425, 429, 500, 502, 503, 504],
-          retryBaseMs: 1100,
-        });
-        const rows = parseChapterRows(parseHtml(text), pageNo);
-        if (rows.length < expectedMinRows) {
-          const err = new Error(`Trang ${pageNo} chỉ đọc được ${rows.length}/${expectedMinRows} dòng chương.`);
-          err.status = 599;
-          throw err;
-        }
-        return rows;
-      } catch (err) {
-        lastError = err;
-        if (pass < 2) await sleep(1800 * (pass + 1) + Math.random() * 900);
-      }
+    const { text } = await requestText(url, {
+      retries: 0,
+      timeoutMs: 15000,
+    });
+    const rows = parseChapterRows(parseHtml(text), pageNo);
+    if (rows.length < expectedMinRows) {
+      const err = new Error(`Trang ${pageNo} chỉ đọc được ${rows.length}/${expectedMinRows} dòng chương.`);
+      err.status = 599;
+      err.page = pageNo;
+      throw err;
     }
-    throw new Error(`Trang chương ${pageNo} tải thất bại sau nhiều lần thử: ${lastError?.message || lastError}`);
+    return rows;
   }
 
   async function loadChapters() {
     requireStory();
     state.editCache.clear();
     const root = `/mystory/${state.storyId}/chapters`;
+
+    // Trang đầu chứa bộ đếm + pagination nên vẫn retry nhẹ, nhưng không dùng chuỗi
+    // retry lồng nhiều tầng như bản cũ.
     const first = await requestText(root, {
-      retries: 4,
+      retries: 2,
       retryStatuses: [404, 408, 425, 429, 500, 502, 503, 504],
-      retryBaseMs: 1100,
+      retryBaseMs: 900,
+      timeoutMs: 15000,
     });
     const firstDoc = parseHtml(first.text);
     const expected = parseCountFromPage(firstDoc);
@@ -935,45 +933,98 @@ ${friendlyError(error)}`);
     const maxPages = Math.min(detected, clamp(state.cfg.maxPages, 1, 500));
     const firstRows = parseChapterRows(firstDoc, 1);
     if (!firstRows.length) throw new Error('Trang chương đầu tiên không đọc được dòng nào. Không tiếp tục để tránh danh sách thiếu.');
+
     const pageSize = firstRows.length;
-    let all = firstRows.slice();
-    const pages = Array.from({ length: Math.max(0, maxPages - 1) }, (_, i) => i + 2);
-    const pageErrors = [];
+    const pageRows = new Map([[1, firstRows]]);
     const loadedPages = new Set([1]);
-    if (pages.length) {
-      // Tối đa 2 luồng cho trang danh sách. Bản cũ chạy quá nhanh và im lặng bỏ
-      // những trang bị nginx trả 404, nên 1618 chương chỉ còn 1268.
-      const results = await mapLimit(pages, Math.min(2, state.cfg.readWorkers), async p => {
+    const pages = Array.from({ length: Math.max(0, maxPages - 1) }, (_, i) => i + 2);
+
+    // Có thể dùng 4 worker để che thời gian TTFB chậm của từng page, nhưng requestBucket
+    // vẫn áp throttle toàn cục read-list (~180ms giữa các lần bắt đầu request), nên không
+    // bắn 4 GET cùng lúc vào TYT.
+    const listWorkers = Math.min(4, Math.max(1, state.cfg.readWorkers | 0));
+
+    let pending = pages.slice();
+    if (pending.length) {
+      const firstPass = await mapLimit(pending, listWorkers, async p => {
         const minRows = p < maxPages ? pageSize : 1;
         const rows = await fetchChapterListPage(root, p, minRows);
         return { ok: true, page: p, rows };
-      }, (d,t,r,i) => {
-        setProgress(d,t);
-        setStatus(`Tải trang chương: ${d}/${t}`);
-        if (r?.error) {
-          const page = pages[i];
-          pageErrors.push({ page, error: r.error });
-          debugLog(`Không tải được trang danh sách chương ${page}`, r.error, 'error');
+      }, (done, total, result, index) => {
+        setProgress(done, total);
+        setStatus(`Tải trang chương: ${done}/${total}`);
+        if (result?.error) {
+          const page = pending[index];
+          debugLog(`Trang ${page} lỗi ở lượt đầu; sẽ retry riêng sau khi quét hết.`, result.error, 'warn');
         }
       });
-      results.forEach(r => {
-        if (r?.ok && Array.isArray(r.rows)) {
-          loadedPages.add(r.page);
-          all.push(...r.rows);
+
+      const failedPages = [];
+      firstPass.forEach((result, index) => {
+        const page = pending[index];
+        if (result?.ok && Array.isArray(result.rows)) {
+          pageRows.set(page, result.rows);
+          loadedPages.add(page);
+        } else {
+          failedPages.push(page);
         }
       });
+      pending = failedPages;
     }
-    if (pageErrors.length || loadedPages.size !== maxPages) {
+
+    // Chỉ retry những page thực sự lỗi. Tối đa 2 vòng, không nhân chéo với retry nội bộ.
+    // Retry dùng tối đa 2 worker để giảm áp lực lên origin khi server đang có dấu hiệu chậm.
+    for (let round = 1; pending.length && round <= 2; round++) {
+      const retryPages = pending.slice();
+      const waitMs = round === 1 ? 1200 : 2600;
+      setStatus(`Chờ retry ${retryPages.length} trang lỗi...`);
+      await sleep(waitMs + Math.random() * 500);
+
+      const retryResults = await mapLimit(retryPages, Math.min(2, listWorkers), async p => {
+        const minRows = p < maxPages ? pageSize : 1;
+        const rows = await fetchChapterListPage(root, p, minRows);
+        return { ok: true, page: p, rows };
+      }, (done, total, result, index) => {
+        setStatus(`Retry trang lỗi vòng ${round}: ${done}/${total}`);
+        if (result?.error) {
+          const page = retryPages[index];
+          debugLog(`Trang ${page} vẫn lỗi ở retry vòng ${round}.`, result.error, 'warn');
+        }
+      });
+
+      const stillFailed = [];
+      retryResults.forEach((result, index) => {
+        const page = retryPages[index];
+        if (result?.ok && Array.isArray(result.rows)) {
+          pageRows.set(page, result.rows);
+          loadedPages.add(page);
+        } else {
+          stillFailed.push(page);
+        }
+      });
+      pending = stillFailed;
+    }
+
+    if (pending.length || loadedPages.size !== maxPages) {
       const missing = pages.filter(p => !loadedPages.has(p));
-      throw new Error(`Danh sách chương chưa đủ: thiếu trang ${missing.join(', ') || pageErrors.map(x => x.page).join(', ')}. Script đã dừng, không dùng danh sách thiếu.`);
+      throw new Error(`Danh sách chương chưa đủ: thiếu trang ${missing.join(', ') || pending.join(', ')}. Đã retry riêng từng trang lỗi; script dừng để không dùng danh sách thiếu.`);
     }
+
+    let all = [];
+    for (let p = 1; p <= maxPages; p++) {
+      const rows = pageRows.get(p);
+      if (rows?.length) all.push(...rows);
+    }
+
     const byId = new Map();
     all.forEach(ch => { if (!byId.has(ch.chapterId)) byId.set(ch.chapterId, ch); });
     all = [...byId.values()];
+
     const maxItems = clamp(state.cfg.maxItems, 1, 20000);
     const truncatedByItems = all.length > maxItems;
     if (truncatedByItems) all = all.slice(0, maxItems);
     all.sort(chapterCompare);
+
     state.chapters = all;
     state.lastChapterSelectionIndex = null;
     state.chapterViewPage = 1;
@@ -987,10 +1038,15 @@ ${friendlyError(error)}`);
       truncatedByItems,
       pageSize,
     };
+
     renderChapters();
+
     let msg = `Đã tải ${all.length} chương / ${loadedPages.size} trang.`;
-    if (state.chapterMeta.truncatedByPages || truncatedByItems) msg += ' DANH SÁCH BỊ CẮT DO GIỚI HẠN.';
-    else if (state.chapterMeta.countMismatch) msg += ` Bộ đếm web ghi ${expected}; mọi trang đều đã tải đủ nên đây mới chỉ là cảnh báo bộ đếm.`;
+    if (state.chapterMeta.truncatedByPages || truncatedByItems) {
+      msg += ' DANH SÁCH BỊ CẮT DO GIỚI HẠN.';
+    } else if (state.chapterMeta.countMismatch) {
+      msg += ` Bộ đếm web ghi ${expected}; mọi trang đều đã tải đủ nên đây mới chỉ là cảnh báo bộ đếm.`;
+    }
     log(msg, state.chapterMeta.truncatedByPages || truncatedByItems ? 'warn' : 'info');
   }
 
@@ -2206,7 +2262,7 @@ ${friendlyError(error)}`);
         </div></details>
         <details class="tytb-details"><summary>Giới hạn tải, tốc độ và giao diện</summary><div class="tytb-details-body">
           <div class="tytb-row"><label>Tối đa trang <input id="tytb-max-pages" type="number" value="${state.cfg.maxPages}" min="1" max="500"></label><label>Tối đa chương <input id="tytb-max-items" type="number" value="${state.cfg.maxItems}" min="1" max="20000"></label></div>
-          <div class="tytb-row"><label>Luồng đọc <input id="tytb-read-workers" type="number" value="${state.cfg.readWorkers}" min="1" max="8"></label><label>Luồng ghi <input id="tytb-write-workers" type="number" value="${state.cfg.writeWorkers}" min="1" max="4"></label><label>Nghỉ ghi <input id="tytb-write-delay" type="number" value="${state.cfg.writeDelay}" min="50" max="2000"> ms</label></div>
+          <div class="tytb-row"><label>Luồng đọc <input id="tytb-read-workers" type="number" value="${state.cfg.readWorkers}" min="1" max="8"></label><label>Luồng ghi <input id="tytb-write-workers" type="number" value="${state.cfg.writeWorkers}" min="1" max="4"></label><label>Nghỉ ghi <input id="tytb-write-delay" type="number" value="${state.cfg.writeDelay}" min="50" max="2000"> ms</label></div><div class="tytb-hint">Tải danh sách chương dùng tối đa 4 luồng để che thời gian chờ server nhưng vẫn giữ giới hạn nhịp GET toàn cục; trang lỗi chỉ được retry riêng tối đa 2 vòng.</div>
           <div class="tytb-row"><label>Rộng panel desktop <input id="tytb-panel-width" type="number" value="${clamp(state.cfg.panelWidth,720,1400)}" min="720" max="1400"> px</label><button type="button" data-action="save-settings">Lưu</button><button type="button" data-action="check-update">Kiểm tra cập nhật</button></div><div class="tytb-hint">Tự kiểm tra bản mới khi khởi động; kết quả được lưu 30 phút để tránh gọi GitHub liên tục.</div>
         </div></details>
       </div>
