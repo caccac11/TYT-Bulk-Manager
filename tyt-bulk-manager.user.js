@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TYT Bulk Manager
 // @namespace    https://github.com/caccac11/TYT-Bulk-Manager
-// @version      1.6.3
-// @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, đổi tên, đánh số và thống kê doanh thu.
+// @version      1.6.4
+// @description  Quản lý truyện và chương TYT: nhập/xuất TXT, cập nhật, Retry riêng chương lỗi, đổi tên, đánh số và thống kê doanh thu.
 // @author       Gin Kai
 // @homepageURL  https://github.com/caccac11/TYT-Bulk-Manager
 // @supportURL   https://github.com/caccac11/TYT-Bulk-Manager/issues
@@ -21,7 +21,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '1.6.3';
+  const VERSION = '1.6.4';
   const MAX_CHAPTER_NUMBER = 9999;
   const MAX_MULTI = 10;
   const CACHE_TTL = 60 * 1000;
@@ -77,6 +77,7 @@
     earnings: new Map(),
     wallet: null,
     editCache: new Map(),
+    txtRetryJobs: new Map(),
     busy: false,
     cancelled: false,
     logs: [],
@@ -1045,10 +1046,14 @@ ${friendlyError(error)}`);
     const visible = state.chapters.slice(metrics.start, metrics.end);
     body.innerHTML = visible.map((ch, offset) => {
       const index = metrics.start + offset;
+      const retryJob = state.txtRetryJobs.get(ch.chapterId);
+      const retryHtml = retryJob
+        ? `<div class="tytb-retry-row"><button type="button" class="tytb-retry-btn" data-action="retry-txt-chapter" data-cid="${ch.chapterId}" title="Chỉ cập nhật lại chương ${ch.number ?? index + 1}">Retry</button><span>lần thử: ${retryJob.attempts || 0}</span></div>`
+        : '';
       return `<tr data-cid="${ch.chapterId}" data-index="${index}">
         <td class="check"><input class="tytb-chk" type="checkbox" aria-label="Chọn chương ${ch.number ?? index + 1}" ${ch.selected ? 'checked' : ''}></td>
         <td class="num">${ch.number ?? ''}</td><td class="title">${escHtml(ch.title)}</td>
-        <td class="note">${escHtml(ch.note || '')}</td></tr>`;
+        <td class="note">${escHtml(ch.note || '')}${retryHtml}</td></tr>`;
     }).join('');
 
     const selectedCount = state.chapters.reduce((count, ch) => count + (ch.selected ? 1 : 0), 0);
@@ -1229,35 +1234,64 @@ ${friendlyError(error)}`);
   }
 
   async function verifyChapterUpdate(ref, expected, changedKeys) {
-    let last = null;
+    const expectedContent = changedKeys.has('content') ? comparableChapterText(expected.content) : '';
     for (let attempt = 0; attempt < 3; attempt++) {
       if (attempt) await sleep(500 * attempt);
       state.editCache.delete(editCacheKey(ref));
       const fresh = await getEditState(ref, true);
-      last = fresh;
       const titleOk = !changedKeys.has('title') || fresh.title === expected.title;
       const numberOk = !changedKeys.has('number') || fresh.number === expected.number;
-      const contentOk = !changedKeys.has('content') || comparableChapterText(fresh.content) === comparableChapterText(expected.content);
+      const contentOk = !changedKeys.has('content') || comparableChapterText(fresh.content) === expectedContent;
       const publishedOk = !changedKeys.has('published') || String(fresh.published) === String(expected.published);
       if (titleOk && numberOk && contentOk && publishedOk) return fresh;
     }
-    throw new Error(`Máy chủ báo thành công nhưng xác minh lại chương ${ref.number ?? '?'} không khớp dữ liệu đã gửi.`);
+    throw new Error(`Xác minh lại chương ${ref.number ?? '?'} không khớp dữ liệu đã gửi.`);
+  }
+
+  function mayHaveCommittedPost(error) {
+    const message = String(error?.message || error || '');
+    if (/HTTP\s*5\d\d/i.test(message)) return true;
+    if (error?.status) return false;
+    return /request bị treo|timeout|timed out|failed to fetch|networkerror|load failed|không kết nối/i.test(message);
   }
 
   async function updateChapter(chapterOrId, changes) {
     const ref = chapterRef(chapterOrId);
-    const edit = await getEditState(ref, true);
+    // Không force GET ở đây. Nếu backup/preload vừa lấy edit-state thì dùng cache;
+    // nếu chưa có cache, getEditState tự GET đúng một lần.
+    const edit = await getEditState(ref);
     const next = { ...edit, ...changes };
     next.title = normSpace(next.title);
     next.number = Number(next.number);
     next.content = String(next.content || '').trim() || BLANK_P;
     if (!next.title || next.title.length > 200) throw new Error('Tiêu đề rỗng hoặc dài quá 200 ký tự.');
     if (!Number.isInteger(next.number) || next.number < 1 || next.number > MAX_CHAPTER_NUMBER) throw new Error(`Số chương không hợp lệ: ${next.number}`);
+
+    const changedKeys = new Set(Object.keys(changes || {}));
     const payload = { ...edit.fields, title: next.title, number: String(next.number), content: next.content };
     if (next.published !== '') payload.published = String(next.published);
     const updateUrl = edit.updateUrl || ref.updateUrl || `/mystory/${edit.storyId}/chapters/${ref.chapterId}/update`;
-    const res = await postForm(updateUrl, payload, edit.editUrl);
-    const fresh = await verifyChapterUpdate(ref, next, new Set(Object.keys(changes || {})));
+
+    let res;
+    try {
+      res = await postForm(updateUrl, payload, edit.editUrl);
+    } catch (postError) {
+      // POST không được retry tự động để tránh ghi trùng. Nếu lỗi mạng/timeout/5xx
+      // có thể xảy ra sau khi server đã commit, GET xác minh trước khi báo thất bại.
+      if (!mayHaveCommittedPost(postError)) throw postError;
+      try {
+        const fresh = await verifyChapterUpdate(ref, next, changedKeys);
+        Object.assign(ref, { title: fresh.title, number: fresh.number });
+        cacheEditState(editCacheKey(ref), fresh);
+        debugLog(`POST chương ${ref.number ?? '?'} mất phản hồi nhưng dữ liệu trên server đã đúng.`, postError, 'warn');
+        return { ok: true, recovered: true, message: 'Dữ liệu đã được ghi dù phản hồi POST bị gián đoạn.' };
+      } catch (verifyError) {
+        debugLog(`POST chương ${ref.number ?? '?'} lỗi và dữ liệu chưa xác minh được.`, { postError, verifyError }, 'error');
+        throw postError;
+      }
+    }
+
+    const fresh = await verifyChapterUpdate(ref, next, changedKeys);
     Object.assign(ref, { title: fresh.title, number: fresh.number });
     cacheEditState(editCacheKey(ref), fresh);
     return res;
@@ -1463,9 +1497,10 @@ ${friendlyError(error)}`);
   }
 
   function headingInfo(text) {
-    let m = normSpace(text).match(CHAPTER_HEADING_RE);
+    const normalized = normSpace(text);
+    let m = normalized.match(CHAPTER_HEADING_RE);
     if (m) return { number: Number(m[1]), tail: normSpace(m[2] || '') };
-    m = normSpace(text).match(CN_HEADING_RE);
+    m = normalized.match(CN_HEADING_RE);
     if (m) return { number: Number(m[1]), tail: normSpace(m[2] || '') };
     return null;
   }
@@ -1495,9 +1530,11 @@ ${friendlyError(error)}`);
 
   function txtHeadingInfo(line) {
     let text = String(line || '').replace(/^\uFEFF/, '').trim();
+    if (!text) return null;
     if (/^={3,}/.test(text) && /={3,}$/.test(text)) {
       text = text.replace(/^={3,}\s*/, '').replace(/\s*={3,}$/, '').trim();
     }
+    if (!/^(?:(?:chương|chapter|chap)\s*[0-9]{1,6}\b|第\s*[0-9]{1,6}\s*章)/i.test(text)) return null;
     return headingInfo(text);
   }
 
@@ -1529,16 +1566,22 @@ ${friendlyError(error)}`);
   function htmlToPlainText(html) {
     const doc = parseHtml(`<body>${html || ''}</body>`);
     const blockTags = new Set(['P','DIV','H1','H2','H3','H4','H5','H6','LI','BLOCKQUOTE','PRE','TR']);
+    const parts = [];
     function walk(node) {
-      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
-      if (node.nodeType !== Node.ELEMENT_NODE) return '';
-      if (node.tagName === 'BR') return '\n';
-      let text = '';
-      node.childNodes.forEach(child => { text += walk(child); });
-      if (blockTags.has(node.tagName)) text += '\n\n';
-      return text;
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (node.nodeValue) parts.push(node.nodeValue);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (node.tagName === 'BR') {
+        parts.push('\n');
+        return;
+      }
+      node.childNodes.forEach(walk);
+      if (blockTags.has(node.tagName)) parts.push('\n\n');
     }
-    return walk(doc.body)
+    walk(doc.body);
+    return parts.join('')
       .replace(/\u00a0/g, ' ')
       .replace(/[ \t]+\n/g, '\n')
       .replace(/\n[ \t]+/g, '\n')
@@ -1711,6 +1754,62 @@ ${friendlyError(error)}`);
     return { chapters, ignored: ignoredLines.length, ignoredLines, headingCount };
   }
 
+  function setTxtRetryJob(plan, sourceLabel, error) {
+    const chapterId = plan?.ch?.chapterId;
+    if (!chapterId) return;
+    const previous = state.txtRetryJobs.get(chapterId);
+    state.txtRetryJobs.set(chapterId, {
+      storyId: plan.ch.storyId || state.storyId,
+      chapterId,
+      number: plan.ch.number,
+      title: plan.title,
+      content: plan.content,
+      sourceLabel,
+      attempts: previous?.attempts || 0,
+      lastError: friendlyError(error),
+      updatedAt: Date.now(),
+    });
+  }
+
+  function clearTxtRetryJob(chapterId) {
+    if (chapterId) state.txtRetryJobs.delete(chapterId);
+  }
+
+  async function retryTxtChapter(chapterId) {
+    const job = state.txtRetryJobs.get(String(chapterId || ''));
+    if (!job) throw new Error('Không còn dữ liệu retry cho chương này.');
+    if (job.storyId !== state.storyId) {
+      throw new Error('Dữ liệu retry thuộc truyện khác. Hãy chọn đúng truyện và cập nhật lại TXT.');
+    }
+
+    const ref = state.chapters.find(ch => ch.chapterId === job.chapterId) || {
+      storyId: job.storyId,
+      chapterId: job.chapterId,
+      number: job.number,
+      title: job.title,
+    };
+
+    job.attempts = (job.attempts || 0) + 1;
+    job.updatedAt = Date.now();
+    try {
+      await updateChapter(ref, { title: job.title, content: job.content });
+      ref.title = job.title;
+      ref.note = `Đã cập nhật ${job.sourceLabel} sau Retry #${job.attempts}`;
+      clearTxtRetryJob(job.chapterId);
+      renderChapters();
+      log(`Retry chương ${ref.number ?? job.number ?? '?'} thành công.`, 'success');
+      return { ok: true };
+    } catch (error) {
+      job.lastError = friendlyError(error);
+      job.updatedAt = Date.now();
+      ref.note = `Lỗi cập nhật ${job.sourceLabel}: ${job.lastError}`;
+      state.txtRetryJobs.set(job.chapterId, job);
+      renderChapters();
+      log(`Retry chương ${ref.number ?? job.number ?? '?'} không thành công: ${job.lastError}`, 'error');
+      throw error;
+    }
+  }
+
   async function applyParsedChapterUpdates(parsed, sourceLabel) {
     const grouped = new Map();
     parsed.forEach(ch => {
@@ -1736,30 +1835,38 @@ ${friendlyError(error)}`);
       if (!web) { missing.push(num); continue; }
       const src = arr[0];
       if (src.visibleChars < 1) throw new Error(`Chương ${num} trong ${sourceLabel} rỗng.`);
-      plans.push({ ch: web, title: src.title, content: src.content });
+      plans.push({ ch: web, title: src.title, content: src.content, visibleChars: src.visibleChars });
     }
     if (!plans.length) throw new Error(`Không có số chương nào trong ${sourceLabel} khớp danh sách web.`);
 
     const preview = plans.slice(0, 100)
-      .map(p => `${p.ch.number}: ${p.ch.title}\n   → ${p.title} | ${visibleTextLength(p.content)} ký tự`)
+      .map(p => `${p.ch.number}: ${p.ch.title}\n   → ${p.title} | ${p.visibleChars} ký tự`)
       .join('\n');
     const missText = missing.length
       ? `\n\nKhông tìm thấy trên web: ${missing.slice(0, 50).join(', ')}${missing.length > 50 ? '...' : ''}`
       : '';
     if (!await confirmModal(`Cập nhật nội dung từ ${sourceLabel}`, `${plans.length} chương sẽ cập nhật theo SỐ CHƯƠNG, không theo vị trí.\n\n${preview}${missText}`, 'CẬP NHẬT')) return;
+
     if (!await prepareBackup(plans.map(p => p.ch), `cập nhật nội dung từ ${sourceLabel}`)) return;
 
+    // Không preload fail-fast cho TXT. Mỗi chương tự GET/POST/verify độc lập:
+    // một chương lỗi không chặn các chương còn lại và payload lỗi được giữ để Retry riêng.
     setProgress(25, 100);
-    await preloadEditStates(plans.map(p => p.ch), `Chuẩn bị cập nhật ${sourceLabel}`);
     let okCount = 0;
     const results = await mapLimit(plans, state.cfg.writeWorkers, async p => {
-      await updateChapter(p.ch, { title: p.title, content: p.content });
-      p.ch.title = p.title;
-      p.ch.note = `Đã cập nhật ${sourceLabel}`;
-      okCount++;
-      return { ok: true, p };
+      try {
+        await updateChapter(p.ch, { title: p.title, content: p.content });
+        p.ch.title = p.title;
+        p.ch.note = `Đã cập nhật ${sourceLabel}`;
+        clearTxtRetryJob(p.ch.chapterId);
+        okCount++;
+        return { ok: true, p };
+      } catch (error) {
+        setTxtRetryJob(p, sourceLabel, error);
+        throw error;
+      }
     }, (done, total, result, index) => {
-      setProgress(55 + Math.round(done * 45 / total), 100);
+      setProgress(25 + Math.round(done * 75 / total), 100);
       setStatus(`Cập nhật ${sourceLabel}: ${done}/${total}`);
       if (result?.error) {
         const failedPlan = plans[index];
@@ -1775,10 +1882,12 @@ ${friendlyError(error)}`);
         }, 'error');
       }
     });
+
     renderChapters();
     const failures = results
       .map((result, index) => result?.error ? { plan: plans[index], error: result.error } : null)
       .filter(Boolean);
+
     if (failures.length) {
       const detail = failures.slice(0, 20).map(({ plan, error }) => {
         const number = plan?.ch?.number ?? '?';
@@ -1786,7 +1895,7 @@ ${friendlyError(error)}`);
         return `Chương ${number}${title ? ` — ${title}` : ''}: ${friendlyError(error)}`;
       }).join('; ');
       const more = failures.length > 20 ? `; và ${failures.length - 20} chương lỗi khác (xem nhật ký)` : '';
-      throw new Error(`Cập nhật thành công ${okCount} chương, lỗi ${failures.length} chương. ${detail}${more}`);
+      throw new Error(`Cập nhật thành công ${okCount} chương, lỗi ${failures.length} chương. Các chương lỗi có nút Retry riêng trong bảng. ${detail}${more}`);
     }
   }
 
@@ -2055,7 +2164,7 @@ ${friendlyError(error)}`);
 #tytb-panel.show{display:flex}#tytb-panel *{box-sizing:border-box;min-inline-size:0}.tytb-head{display:flex;align-items:center;gap:9px;padding:9px 11px;background:#212529;border-bottom:1px solid #3b4045;flex:0 0 auto}.tytb-head b{font-size:15px}.tytb-head .grow{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#bfc5ca}.tytb-version{flex:0 0 auto}.tytb-update-badge{flex:0 0 auto;border:1px solid #4ea3ff!important;background:#123b66!important;color:#dceeff!important;border-radius:999px!important;padding:3px 8px!important;font-size:10.5px!important;font-weight:800;line-height:1.25;box-shadow:0 0 0 0 rgba(78,163,255,.35);animation:tytb-update-pulse 2.2s ease-in-out infinite}.tytb-update-badge[hidden]{display:none!important}.tytb-update-short{display:none}@keyframes tytb-update-pulse{0%,100%{box-shadow:0 0 0 0 rgba(78,163,255,0)}50%{box-shadow:0 0 0 4px rgba(78,163,255,.12)}}.tytb-close{font-size:21px;background:transparent!important;border:0!important;color:#fff!important;padding:0 5px!important;flex:0 0 auto}
 .tytb-session{display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-areas:"refresh story open";padding:7px 10px;gap:7px;border-bottom:1px solid #343a40;flex:0 0 auto}.tytb-session>[data-action="load-stories"]{grid-area:refresh}.tytb-session #tytb-story{grid-area:story;width:100%;min-width:0}.tytb-session>[data-action="open-story"]{grid-area:open}.tytb-tabs{display:flex;padding:6px 9px;gap:5px;border-bottom:1px solid #343a40;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.tytb-tabs::-webkit-scrollbar{display:none}.tytb-tabs button{flex:1 0 auto;white-space:nowrap}.tytb-tabs button.active{background:#0d6efd;color:#fff}.tytb-tab-label-short{display:none}
 .tytb-main{flex:1;min-height:0;overflow:auto;padding:9px;overscroll-behavior:contain;scroll-padding-bottom:18px}.tytb-tab{display:none}.tytb-tab.active{display:block}.tytb-row{display:flex;flex-wrap:wrap;gap:7px;align-items:center;margin:6px 0}.tytb-row.compact{margin:4px 0}.tytb-row label{display:flex;gap:5px;align-items:center}.tytb-row .grow{flex:1;min-width:0}.tytb-box{border:1px solid #3d4248;border-radius:8px;padding:9px;margin-bottom:8px;background:#1e2125}.tytb-box h3{font-size:14px;margin:0 0 7px}.tytb-btn,#tytb-panel button{background:#343a40;color:#f8f9fa;border:1px solid #5c636a;border-radius:6px;padding:6px 9px;cursor:pointer;touch-action:manipulation}.tytb-btn.primary,#tytb-panel button.primary{background:#0d6efd;border-color:#0d6efd}.tytb-btn.danger,#tytb-panel button.danger{background:#a52834;border-color:#c63c49}.tytb-btn.warn{background:#806509}.tytb-btn:disabled,#tytb-panel button:disabled,.tytb-btn.disabled{opacity:.45;cursor:not-allowed;pointer-events:none}#tytb-panel input,#tytb-panel select,#tytb-panel textarea{background:#111418;color:#f8f9fa;border:1px solid #555b61;border-radius:5px;padding:5px 7px;max-width:100%}#tytb-panel input[type=number]{width:84px;flex:0 0 auto}#tytb-panel input[type=text]{min-width:0}.tytb-row label.grow input[type=text]{width:100%}.tytb-actions{display:flex;gap:7px;flex-wrap:wrap}.tytb-actions>*{min-width:0}.tytb-actions .primary{min-width:110px}.tytb-file-picker{display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.tytb-upload-picker .tytb-hint{flex:1 1 180px}
-.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px;overflow-wrap:anywhere}.tytb-table .note{width:120px;overflow-wrap:anywhere}.tytb-table .num{font-variant-numeric:tabular-nums}.tytb-chapter-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin:7px 0}.tytb-chapter-pager[hidden]{display:none}.tytb-chapter-page-info{min-width:180px;text-align:center;color:#adb5bd;font-size:12px;font-variant-numeric:tabular-nums}
+.tytb-table-wrap{overflow:auto;max-height:49vh;border:1px solid #343a40;border-radius:6px;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}.tytb-table{border-collapse:collapse;width:100%;font-size:12px}.tytb-table th,.tytb-table td{border-bottom:1px solid #343a40;border-right:1px solid #2d3135;padding:5px 6px;vertical-align:top}.tytb-table th{position:sticky;top:0;background:#2b3035;z-index:1;white-space:nowrap}.tytb-table .title{min-width:300px;overflow-wrap:anywhere}.tytb-table .note{width:150px;overflow-wrap:anywhere}.tytb-table .num{font-variant-numeric:tabular-nums}.tytb-retry-row{display:flex;align-items:center;gap:6px;margin-top:5px;color:#adb5bd;font-size:10px}.tytb-retry-btn{padding:2px 7px!important;min-height:0!important;background:#806509!important;border-color:#a8840b!important;color:#fff!important;font-weight:700}.tytb-chapter-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin:7px 0}.tytb-chapter-pager[hidden]{display:none}.tytb-chapter-page-info{min-width:180px;text-align:center;color:#adb5bd;font-size:12px;font-variant-numeric:tabular-nums}
 .tytb-queue{max-height:230px;overflow:auto;border:1px solid #343a40;border-radius:6px;padding:3px 6px;overscroll-behavior:contain}.tytb-queue:empty{display:none}.tytb-queue>div{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;border-bottom:1px solid #2d3135;padding:4px 1px}.tytb-queue>div:last-child{border-bottom:0}.tytb-queue>div>span{flex:1;min-width:0;overflow-wrap:anywhere;word-break:break-word}.tytb-queue button{padding:0 7px!important;flex:0 0 auto}.tytb-hint{color:#adb5bd;font-size:12px;overflow-wrap:anywhere}.tytb-muted{color:#8f989f}.tytb-inline-title{font-weight:600}.tytb-details{border:1px solid #343a40;border-radius:7px;margin-top:7px;background:#191c20}.tytb-details>summary{cursor:pointer;padding:7px 9px;color:#cbd0d5;font-weight:600;user-select:none}.tytb-details[open]>summary{border-bottom:1px solid #343a40}.tytb-details-body{padding:7px 9px}
 .tytb-foot{border-top:1px solid #495057;background:#212529;padding:7px 10px;flex:0 0 auto}.tytb-statusline{display:flex;gap:9px;align-items:center}.tytb-statusline #tytb-status{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tytb-progress{height:6px;background:#343a40;border-radius:99px;overflow:hidden;margin-top:6px}.tytb-progress>div{height:100%;width:0;background:#0d6efd}.tytb-log-details{margin-top:5px}.tytb-log-details>summary{cursor:pointer;color:#adb5bd;font-size:12px}.tytb-log-head{display:flex;justify-content:flex-end;gap:5px;margin:5px 0}.tytb-log-head button{padding:2px 7px!important;font-size:11px}.tytb-log{height:110px;overflow:auto;background:#111418;border:1px solid #343a40;border-radius:6px;padding:3px 7px;font-size:12px;overscroll-behavior:contain}.tytb-log-entry{display:grid;grid-template-columns:55px 62px minmax(0,1fr);gap:6px;padding:4px 0;border-bottom:1px solid #252a2f}.tytb-log-entry:last-child{border-bottom:0}.tytb-log-time{color:#8d969f;font-variant-numeric:tabular-nums}.tytb-log-badge{font-size:9px;line-height:17px;text-align:center;border-radius:999px;background:#343a40}.tytb-log-message{min-width:0;overflow-wrap:anywhere}.tytb-log-success .tytb-log-badge{background:#1f6f43;color:#d8f3e5}.tytb-log-warn .tytb-log-badge{background:#765c10;color:#fff1b8}.tytb-log-error .tytb-log-badge{background:#842029;color:#ffd7da}.tytb-log-info .tytb-log-badge{background:#244f7a;color:#dbeeff}.tytb-log-error .tytb-log-message{color:#ffb4bb}.tytb-log-warn .tytb-log-message{color:#ffe08a}.tytb-log-success .tytb-log-message{color:#a9e8c5}
 .tytb-author-note{margin-top:7px;padding-top:7px;border-top:1px solid #343a40;color:#adb5bd;font-size:11px;line-height:1.45;text-align:center;overflow-wrap:anywhere}.tytb-author-note a{color:#8ab4f8;font-weight:700;text-decoration:none}.tytb-author-note a:hover{text-decoration:underline}.tytb-author-name{position:relative;display:inline-block;isolation:isolate;animation:tytb-glitch-main 5.6s infinite}.tytb-author-name::before,.tytb-author-name::after{content:attr(data-text);position:absolute;inset:0;pointer-events:none;opacity:0}.tytb-author-name::before{color:#ff5f7a}.tytb-author-name::after{color:#66d9ff}@keyframes tytb-glitch-main{0%,90%,95%,100%{transform:none;text-shadow:none;opacity:1}91%{transform:translateX(-1px);text-shadow:1px 0 #ff5f7a,-1px 0 #66d9ff}92%{transform:translateX(1px);opacity:.65}93%{transform:translateX(-1px);text-shadow:-1px 0 #ff5f7a,1px 0 #66d9ff}94%{transform:none;opacity:1}}@keyframes tytb-glitch-before{0%,90%,95%,100%{opacity:0;transform:none}91%{opacity:.75;transform:translate(-1px,-1px);clip-path:inset(0 0 55% 0)}92%{opacity:.2;transform:translate(1px,0);clip-path:inset(45% 0 20% 0)}93%{opacity:.7;transform:translate(-1px,1px);clip-path:inset(70% 0 0 0)}94%{opacity:0}}@keyframes tytb-glitch-after{0%,90%,95%,100%{opacity:0;transform:none}91%{opacity:.45;transform:translate(1px,1px);clip-path:inset(60% 0 0 0)}92%{opacity:.7;transform:translate(-1px,0);clip-path:inset(20% 0 55% 0)}93%{opacity:.25;transform:translate(1px,-1px);clip-path:inset(40% 0 25% 0)}94%{opacity:0}}.tytb-author-name::before{animation:tytb-glitch-before 5.6s infinite}.tytb-author-name::after{animation:tytb-glitch-after 5.6s infinite}
@@ -2153,7 +2262,7 @@ ${friendlyError(error)}`);
     });
     document.querySelector('#tytb-story').onchange = e => {
       state.storyId = e.target.value; state.storyTitle = state.stories.find(x=>x.id===state.storyId)?.title || state.storyId;
-      state.chapters=[]; state.chapterMeta=null; state.editCache.clear(); state.lastChapterSelectionIndex=null; state.chapterViewPage=1; renderChapters(); renderStorySelect();
+      state.chapters=[]; state.chapterMeta=null; state.editCache.clear(); state.txtRetryJobs.clear(); state.lastChapterSelectionIndex=null; state.chapterViewPage=1; renderChapters(); renderStorySelect();
     };
     document.querySelector('#tytb-upload-files').onchange = async e => {
       const input = e.target;
@@ -2230,6 +2339,13 @@ ${friendlyError(error)}`);
     panel.addEventListener('click', e => {
       const btn=e.target.closest('[data-action]'); if(!btn)return;
       const a=btn.dataset.action;
+      if (a === 'retry-txt-chapter') {
+        const cid = btn.dataset.cid || '';
+        const job = state.txtRetryJobs.get(cid);
+        const num = job?.number ?? state.chapters.find(ch => ch.chapterId === cid)?.number ?? '?';
+        runTask(`Retry chương ${num}`, () => retryTxtChapter(cid));
+        return;
+      }
       const actions = {
         'load-stories':()=>runTask('Nạp danh sách truyện',loadStories),
         'open-story':()=>{if(state.storyId)window.open(`/mystory/${state.storyId}/`,'_blank');},
